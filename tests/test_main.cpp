@@ -1,9 +1,11 @@
 #include "../src/board.hpp"
 #include "../src/movegen.hpp"
 #include "../src/eval.hpp"
+#include "../src/search.hpp"
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <chrono>
 
 // ============================================================
 // Minimal test framework
@@ -290,8 +292,61 @@ static void test_eval_symmetric() {
 }
 
 // ============================================================
-// main
+// Test: search timing - engine must not far exceed the movetime budget
 // ============================================================
+static void test_search_respects_movetime() {
+    struct Case { int budget_ms; double tolerance; };
+    // Shorter budgets allow proportionally more OS jitter overhead;
+    // longer budgets should finish closer to the target.
+    const Case cases[] = {
+        {100,  2.0},
+        {500,  1.5},
+        {1000, 1.5},
+    };
+
+    for (auto& c : cases) {
+        Board b;
+        b.set_startpos();
+
+        auto t0 = std::chrono::steady_clock::now();
+        (void)iterative_deepening(b, c.budget_ms);
+        auto t1 = std::chrono::steady_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        bool within_tolerance = elapsed_ms <= c.budget_ms * c.tolerance;
+        if (!within_tolerance) {
+            std::cerr << "FAIL  " << __FILE__ << ':' << __LINE__
+                      << "  search with budget=" << c.budget_ms
+                      << "ms took " << static_cast<int>(elapsed_ms)
+                      << "ms (tolerance " << static_cast<int>(c.budget_ms * c.tolerance) << "ms)\n";
+            g_fail++;
+        } else {
+            g_pass++;
+        }
+    }
+}
+
+// ============================================================
+// Test: time allocation for normal game times is reasonable
+// ============================================================
+static void test_time_allocation_reasonable() {
+    // 10-minute game, no byoyomi: capped at 5000 ms
+    CHECK_EQ(compute_allotted_ms(600000, 0), 5000);
+
+    // 5-minute remaining, no byoyomi: still capped
+    CHECK_EQ(compute_allotted_ms(300000, 0), 5000);
+
+    // 30-second remaining, no byoyomi: 30000/40 = 750 ms
+    CHECK_EQ(compute_allotted_ms(30000, 0), 750);
+
+    // Very low time: floored at 100 ms
+    CHECK_EQ(compute_allotted_ms(1000, 0), 100);
+
+    // Byoyomi-heavy: 1000/40 + 30000/2 = 25 + 15000 = 15025, capped at 5000 ms
+    CHECK_EQ(compute_allotted_ms(1000, 30000), 5000);
+}
+
+
 int main() {
     Zobrist::init();
 
@@ -308,6 +363,8 @@ int main() {
     test_king_cant_move_into_check();
     test_move_usi_roundtrip();
     test_eval_symmetric();
+    test_search_respects_movetime();
+    test_time_allocation_reasonable();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "

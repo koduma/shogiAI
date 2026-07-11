@@ -7,6 +7,10 @@
 std::atomic<bool> g_stop{false};
 
 static std::chrono::steady_clock::time_point g_start;
+static int      g_allotted_ms    = 0;
+static uint64_t g_nodes          = 0;
+// Check time every (TIME_CHECK_MASK+1) nodes; initial value forces first-call check.
+static constexpr uint64_t TIME_CHECK_MASK = 0xFFF;
 
 void search_init_time() {
     g_start = std::chrono::steady_clock::now();
@@ -17,6 +21,15 @@ bool time_up(int allotted_ms) {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - g_start).count();
     return elapsed >= allotted_ms;
+}
+
+int compute_allotted_ms(int my_time_ms, int byoyomi_ms) {
+    // Use ~1/40 of remaining clock plus half the byoyomi,
+    // capped at 5 seconds to avoid time-outs in normal games.
+    int v = my_time_ms / 40 + byoyomi_ms / 2;
+    if (v < 100) v = 100;
+    if (v > 5000) v = 5000;
+    return v;
 }
 
 // ============================================================
@@ -38,9 +51,11 @@ static int move_score_order(const Board& b, Move m) {
 // negamax alpha-beta
 // ============================================================
 int negamax(Board& board, int depth, int alpha, int beta, int ply) {
-    // Check time periodically
-    if ((ply & 0xFFF) == 0 && time_up(g_stop.load() ? 0 : INT_MAX)) {
-        // will be caught by caller checking g_stop
+    // Check time every 4096 nodes and set g_stop when budget is exhausted
+    if ((++g_nodes & TIME_CHECK_MASK) == 0) {
+        if (time_up(g_allotted_ms)) {
+            g_stop.store(true, std::memory_order_relaxed);
+        }
     }
     if (g_stop.load(std::memory_order_relaxed)) return 0;
 
@@ -84,6 +99,8 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
 Move iterative_deepening(Board& board, int allotted_ms) {
     search_init_time();
     g_stop.store(false);
+    g_allotted_ms = allotted_ms;
+    g_nodes = TIME_CHECK_MASK;  // first negamax call triggers an immediate time check
 
     Move best_move = MOVE_NONE;
 

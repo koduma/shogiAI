@@ -16,6 +16,12 @@ void search_init_time();
 // Has the allocated time expired?
 bool time_up(int allotted_ms);
 
+// Compute per-move time budget from remaining clock and byoyomi.
+// my_time_ms: remaining time for the side to move (milliseconds, >0).
+// byoyomi_ms: byoyomi period (milliseconds, 0 if none).
+// Returns milliseconds to allocate for this move.
+int compute_allotted_ms(int my_time_ms, int byoyomi_ms);
+
 // Iterative-deepening entry point.
 // Returns the best move found within allotted_ms milliseconds.
 Move iterative_deepening(Board& board, int allotted_ms);
