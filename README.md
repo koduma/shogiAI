@@ -74,6 +74,15 @@ quit
 2. Point it at the `shogi_engine` binary.
 3. Start a game — the engine will respond to `go` commands automatically.
 
+#### Time management notes (ShogiGUI / Windows)
+
+- Leave **usi_ponder** unchecked (☐ False) — ponder is not implemented.
+- The engine uses approximately **1/40 of remaining time per move, capped at 5 seconds**.
+  For a 10-minute game this means at most ~5 s per move, so time-outs should not occur.
+- For very short time controls (e.g. 10-second byoyomi), the engine uses 90 % of
+  the byoyomi period, leaving a small safety margin.
+- `go movetime N` is also supported; the engine will return within roughly `N` ms.
+
 ---
 
 ## Project Structure
@@ -105,7 +114,7 @@ shogiAI/
 * **Piece encoding** — `Piece = (color << 4) | piece_type`; BLACK = 0, WHITE = 1.
 * **Undo stack** — `StateInfo` (captured piece + previous Zobrist hash) is pushed on every `do_move` and popped on `undo_move`.
 * **Evaluation** — Currently pure material; designed to be replaced with a neural-network or hand-crafted positional evaluation without touching the search or board code.
-* **Future improvements** — Transposition table, quiescence search, null-move pruning, better time management, NNUE evaluation.
+* **Future improvements** — Transposition table, quiescence search, null-move pruning, NNUE evaluation.
 
 ---
 

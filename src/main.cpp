@@ -107,9 +107,7 @@ int main() {
             } else {
                 int my_time = (board.side_to_move() == BLACK) ? btime : wtime;
                 if (my_time > 0) {
-                    // Use roughly 1/30 of remaining time + half the byoyomi
-                    allotted_ms = my_time / 30 + byoyomi / 2;
-                    allotted_ms = std::max(allotted_ms, 100);
+                    allotted_ms = compute_allotted_ms(my_time, byoyomi);
                 } else if (byoyomi > 0) {
                     allotted_ms = byoyomi * 9 / 10;
                 } else {
