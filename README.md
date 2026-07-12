@@ -20,6 +20,10 @@ compatible shogi GUI (Shogidroid, ShogiGUI, etc.).
 
 ## Building
 
+### g++ command
+g++ -std=c++17 -O2 -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -o shogi_engine.exe
+
+
 ### Requirements
 - CMake ≥ 3.14
 - A C++17-capable compiler (GCC ≥ 7, Clang ≥ 5, MSVC 2017+)
