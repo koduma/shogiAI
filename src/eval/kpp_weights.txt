@@ -1,0 +1,42 @@
+# ShogiAI KPP-style evaluation parameters
+# model_type: kpp
+#
+# This is a *compact* KPP-style (King-Piece-Piece) parameter file for ShogiAI.
+# It is NOT a full three-piece-relation (KPP/KKP/KPPT) table, and it is NOT
+# an NNUE weight file.  See README.md for details and external references.
+#
+# Format: key=value  (plain text, one per line; '#' lines are comments)
+#
+# Supported keys:
+#   model_type       = kpp | three-piece-relation  (required for format identification)
+#   kpp_weight       = integer centipawn weight applied per K-P-P triple
+#   king_zone_bonus  = integer centipawn bonus per piece near the king
+#   piece_<name>     = integer centipawn value for each piece type
+#
+# Piece-type names: pawn, lance, knight, silver, gold, bishop, rook,
+#                   prom_pawn, prom_lance, prom_knight, prom_silver,
+#                   prom_bishop, prom_rook
+#
+# Missing keys fall back to the built-in default value.
+# Unknown keys are silently ignored for forward compatibility.
+
+model_type=kpp
+
+# Scalar interaction parameters
+kpp_weight=12
+king_zone_bonus=6
+
+# Piece values (centipawns)
+piece_pawn=100
+piece_lance=300
+piece_knight=300
+piece_silver=500
+piece_gold=600
+piece_bishop=800
+piece_rook=1000
+piece_prom_pawn=600
+piece_prom_lance=600
+piece_prom_knight=600
+piece_prom_silver=600
+piece_prom_bishop=1100
+piece_prom_rook=1300

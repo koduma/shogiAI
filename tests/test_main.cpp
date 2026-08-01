@@ -568,6 +568,222 @@ static void test_lmr_preserves_tactical_best_move() {
     CHECK_EQ(best, usi_to_move("5d6e"));
 }
 
+// ============================================================
+// Eval file: helper to write a temporary file
+// ============================================================
+#include <fstream>
+
+static void write_tmp_file(const std::string& path, const std::string& contents) {
+    std::ofstream f(path);
+    f << contents;
+}
+
+// ============================================================
+// Test: explicit KPP eval file is loaded and status reflects it
+// ============================================================
+static void test_eval_explicit_kpp_file_loaded() {
+    const std::string tmp = "/tmp/shogiai_test_kpp_explicit.txt";
+    write_tmp_file(tmp,
+        "model_type=kpp\n"
+        "kpp_weight=12\n"
+        "piece_pawn=100\n");
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("kpp: loaded") != std::string::npos);
+    CHECK(status.find("explicit") != std::string::npos);
+    CHECK(status.find(tmp) != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::KPP);
+
+    // Symmetry preserved after loading
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
+
+    set_eval_file_path(""); // reset
+}
+
+// ============================================================
+// Test: explicit path overrides auto-discovery
+// ============================================================
+static void test_eval_explicit_overrides_auto() {
+    const std::string tmp = "/tmp/shogiai_test_explicit_override.txt";
+    // Use a different kpp_weight to confirm this file is actually loaded
+    write_tmp_file(tmp,
+        "model_type=kpp\n"
+        "kpp_weight=20\n"
+        "piece_pawn=100\n"
+        "piece_lance=300\n"
+        "piece_knight=300\n"
+        "piece_silver=500\n"
+        "piece_gold=600\n"
+        "piece_bishop=800\n"
+        "piece_rook=1000\n"
+        "piece_prom_pawn=600\n"
+        "piece_prom_lance=600\n"
+        "piece_prom_knight=600\n"
+        "piece_prom_silver=600\n"
+        "piece_prom_bishop=1100\n"
+        "piece_prom_rook=1300\n");
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+    CHECK(status.find("explicit") != std::string::npos);
+    CHECK(status.find(tmp) != std::string::npos);
+    // The auto-discovery candidates are NOT mentioned in the status
+    CHECK(status.find("auto-discovery") == std::string::npos);
+
+    set_eval_file_path(""); // reset
+}
+
+// ============================================================
+// Test: NNUE model_type file is recognized as unsupported,
+//       engine stays functional with KPP fallback
+// ============================================================
+static void test_eval_nnue_unsupported_fallback() {
+    const std::string tmp = "/tmp/shogiai_test_nnue.txt";
+    write_tmp_file(tmp, "model_type=nnue\n");
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("unsupported evaluator: nnue") != std::string::npos);
+    CHECK(status.find(tmp) != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::NNUE_UNSUPPORTED);
+
+    // Engine must still return a sensible (non-crash) evaluation
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0); // symmetric position → 0 regardless of params
+
+    set_eval_file_path(""); // reset
+}
+
+// ============================================================
+// Test: file-not-found status and EvalFamily FALLBACK
+// ============================================================
+static void test_eval_file_not_found() {
+    set_eval_file_path("/tmp/shogiai_nonexistent_file_99999.txt");
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("file not found") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::FALLBACK);
+
+    // Engine must still work
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
+
+    set_eval_file_path(""); // reset
+}
+
+// ============================================================
+// Test: parse-error status (file exists but has no valid keys)
+// ============================================================
+static void test_eval_parse_error_status() {
+    const std::string tmp = "/tmp/shogiai_test_comments_only.txt";
+    write_tmp_file(tmp, "# only a comment\n# another comment\n");
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("parse error") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::FALLBACK);
+
+    set_eval_file_path(""); // reset
+}
+
+// ============================================================
+// Test: loading a KPP file with a modified piece_pawn value
+//       actually changes the evaluation result
+// ============================================================
+static void test_eval_custom_piece_value_applied() {
+    const std::string tmp = "/tmp/shogiai_test_pawn200.txt";
+    write_tmp_file(tmp,
+        "model_type=kpp\n"
+        "piece_pawn=200\n"   // doubled pawn value
+        "piece_lance=300\n"
+        "piece_knight=300\n"
+        "piece_silver=500\n"
+        "piece_gold=600\n"
+        "piece_bishop=800\n"
+        "piece_rook=1000\n"
+        "piece_prom_pawn=600\n"
+        "piece_prom_lance=600\n"
+        "piece_prom_knight=600\n"
+        "piece_prom_silver=600\n"
+        "piece_prom_bishop=1100\n"
+        "piece_prom_rook=1300\n");
+
+    set_eval_file_path(tmp);
+
+    // 1 black pawn in hand → score should reflect the 200-cp pawn value
+    Board b;
+    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
+    const int score = evaluate(b);
+    CHECK(score >= 200); // must be at least one 200-cp pawn advantage
+
+    set_eval_file_path(""); // reset
+}
+
+// ============================================================
+// Test: auto-discovery finds eval/kpp_weights.txt in build dir
+//       (CMake copies src/eval/ → build/eval/ at configure time)
+// ============================================================
+static void test_eval_auto_discovery() {
+    // Reset to auto-discovery mode (no explicit path).
+    set_eval_file_path("");
+    const std::string status = eval_status_message();
+
+    // Two acceptable outcomes:
+    //   (a) auto-discovered the build-dir copy: "kpp: loaded from ... [auto-discovered]"
+    //   (b) no file found: "kpp: built-in fallback ..."
+    // Both must NOT claim "unsupported evaluator" and must NOT crash.
+    CHECK(status.find("unsupported evaluator") == std::string::npos);
+
+    const EvalFamily fam = get_eval_family();
+    CHECK(fam == EvalFamily::KPP || fam == EvalFamily::FALLBACK);
+
+    // Evaluation must remain valid and symmetric
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
+
+    set_eval_file_path(""); // ensure reset for subsequent tests
+}
+
+// ============================================================
+// Test: three-piece-relation alias accepted as KPP
+// ============================================================
+static void test_eval_three_piece_relation_alias() {
+    const std::string tmp = "/tmp/shogiai_test_tpr.txt";
+    write_tmp_file(tmp,
+        "model_type=three-piece-relation\n"
+        "kpp_weight=12\n"
+        "piece_pawn=100\n"
+        "piece_lance=300\n"
+        "piece_knight=300\n"
+        "piece_silver=500\n"
+        "piece_gold=600\n"
+        "piece_bishop=800\n"
+        "piece_rook=1000\n"
+        "piece_prom_pawn=600\n"
+        "piece_prom_lance=600\n"
+        "piece_prom_knight=600\n"
+        "piece_prom_silver=600\n"
+        "piece_prom_bishop=1100\n"
+        "piece_prom_rook=1300\n");
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("kpp: loaded") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::KPP);
+
+    set_eval_file_path(""); // reset
+}
+
 
 int main() {
     Zobrist::init();
@@ -600,6 +816,16 @@ int main() {
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();
     test_lmr_preserves_tactical_best_move();
+
+    // Eval file discovery and loading tests
+    test_eval_explicit_kpp_file_loaded();
+    test_eval_explicit_overrides_auto();
+    test_eval_nnue_unsupported_fallback();
+    test_eval_file_not_found();
+    test_eval_parse_error_status();
+    test_eval_custom_piece_value_applied();
+    test_eval_auto_discovery();
+    test_eval_three_piece_relation_alias();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "

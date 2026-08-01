@@ -7,7 +7,23 @@
 
 namespace {
 
-constexpr const char* DEFAULT_EVAL_FILE = "eval/kpp_weights.txt";
+// -----------------------------------------------------------------------
+// Automatic discovery candidates (tried in order when no explicit path is
+// set via setoption/set_eval_file_path/SHOGIAI_EVAL_FILE).
+//
+// Paths are relative to the working directory at runtime:
+//   src/eval/kpp_weights.txt  – preferred; found when running from the
+//                               repository root or when CMake copies it.
+//   eval/kpp_weights.txt      – found when running from the build directory
+//                               (CMake copies src/eval/ → build/eval/).
+// -----------------------------------------------------------------------
+static const char* const DISCOVERY_CANDIDATES[] = {
+    "src/eval/kpp_weights.txt",
+    "eval/kpp_weights.txt",
+};
+
+// Internal family tag used while loading (maps to public EvalFamily later).
+enum class LoadFamily { KPP, NNUE, UNSUPPORTED };
 
 struct EvalParams {
     std::array<int, PT_NB> piece_value{
@@ -17,17 +33,22 @@ struct EvalParams {
     int king_zone_bonus = 6;
 };
 
-EvalParams g_params;
-bool g_loaded_once = false;
-std::string g_eval_file_path = DEFAULT_EVAL_FILE;
-std::string g_status = "built-in KPP fallback";
+// Global state
+EvalParams  g_params;
+bool        g_loaded_once  = false;
+bool        g_explicit_path = false; // true if set via set_eval_file_path(non-empty)
+std::string g_eval_file_path;        // empty = use auto-discovery
+std::string g_status       = "kpp: built-in fallback";
+EvalFamily  g_family       = EvalFamily::FALLBACK;
 
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
 inline int manhattan_dist(Square a, Square b) {
     return std::abs(file_of(a) - file_of(b)) + std::abs(rank_of(a) - rank_of(b));
 }
 
-// Lightweight KPP-style interaction:
-// king + piece1 + piece2
+// Compact KPP-style king-piece-piece interaction score for one side.
 int kpp_term_for_side(const Board& board, Color c, const EvalParams& params) {
     std::array<Square, 40> feat_sq{};
     int n = 0;
@@ -40,14 +61,12 @@ int kpp_term_for_side(const Board& board, Color c, const EvalParams& params) {
     }
 
     // Hand pieces are modeled as "virtual nearby pieces" so holdings affect KPP.
-    constexpr int VIRTUAL_HAND_DIST = 3;
     for (int pt = PAWN; pt <= ROOK; ++pt) {
         int count = board.hand(c, static_cast<PieceType>(pt));
         while (count-- > 0 && n < static_cast<int>(feat_sq.size())) {
             int f = std::clamp(file_of(king) + ((pt % 2) ? 1 : -1), 0, 8);
             int r = std::clamp(rank_of(king) + ((pt % 3) ? 1 : -1), 0, 8);
             feat_sq[n++] = make_sq(f, r);
-            (void)VIRTUAL_HAND_DIST;
         }
     }
 
@@ -57,83 +76,190 @@ int kpp_term_for_side(const Board& board, Color c, const EvalParams& params) {
         acc += std::max(0, 6 - d1) * params.king_zone_bonus;
         for (int j = i + 1; j < n; ++j) {
             const int d2 = manhattan_dist(king, feat_sq[j]);
-            // 3-piece relation: K + Pi + Pj
             acc += std::max(0, 8 - (d1 + d2)) * params.kpp_weight;
         }
     }
     return acc;
 }
 
+// Parse the model_type value string into a LoadFamily tag.
+LoadFamily parse_model_type(const std::string& val) {
+    if (val == "kpp" || val == "three-piece-relation") return LoadFamily::KPP;
+    if (val == "nnue")                                  return LoadFamily::NNUE;
+    return LoadFamily::UNSUPPORTED;
+}
+
+// -----------------------------------------------------------------------
+// Load one candidate file.
+// is_auto: true when called from auto-discovery (affects status message).
+// Returns true if the file was successfully loaded as KPP.
+// Returns false on: file not found, parse error, or unsupported model type.
+// On failure, g_status is updated only when !is_auto (explicit path error).
+// -----------------------------------------------------------------------
+bool try_load_from_path(const std::string& path, bool is_auto) {
+    std::ifstream ifs(path);
+    if (!ifs) {
+        if (!is_auto) {
+            g_status = "kpp: built-in fallback (file not found: " + path + ")";
+            g_family = EvalFamily::FALLBACK;
+        }
+        return false;
+    }
+
+    EvalParams loaded = EvalParams{}; // start from built-in defaults
+    std::string line;
+    int loaded_values = 0;
+    LoadFamily file_family = LoadFamily::KPP; // default: KPP if no model_type key
+    bool family_declared = false;
+
+    while (std::getline(ifs, line)) {
+        // Strip trailing CR (Windows line endings)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        const std::string key = line.substr(0, eq);
+        // Strip leading/trailing whitespace from value
+        const std::string raw_val = line.substr(eq + 1);
+        const auto v0 = raw_val.find_first_not_of(" \t");
+        const auto v1 = raw_val.find_last_not_of(" \t\r\n");
+        const std::string val = (v0 == std::string::npos)
+                                ? std::string{}
+                                : raw_val.substr(v0, v1 - v0 + 1);
+
+        // ---- model_type declaration ----
+        if (key == "model_type") {
+            file_family = parse_model_type(val);
+            family_declared = true;
+            if (file_family == LoadFamily::NNUE || file_family == LoadFamily::UNSUPPORTED) {
+                // Unsupported evaluator family – report and fall back.
+                const std::string tag = is_auto ? "auto-discovered" : "explicit";
+                const std::string family_name = (file_family == LoadFamily::NNUE) ? "nnue" : val;
+                g_status = "unsupported evaluator: " + family_name
+                         + " (falling back to built-in kpp; source: " + path
+                         + " [" + tag + "])";
+                g_family = EvalFamily::NNUE_UNSUPPORTED;
+                // Stop auto-discovery even for NNUE; user placed this file intentionally.
+                return false;
+            }
+            continue;
+        }
+
+        // ---- numeric parameters ----
+        int parsed = 0;
+        {
+            std::istringstream iss(val);
+            if (!(iss >> parsed)) continue;
+        }
+
+        if (key == "kpp_weight")      { loaded.kpp_weight      = parsed; loaded_values++; continue; }
+        if (key == "king_zone_bonus") { loaded.king_zone_bonus  = parsed; loaded_values++; continue; }
+        if (key.rfind("piece_", 0) == 0) {
+            const std::string pt_name = key.substr(6);
+            PieceType t = NO_PT;
+            if      (pt_name == "pawn")        t = PAWN;
+            else if (pt_name == "lance")       t = LANCE;
+            else if (pt_name == "knight")      t = KNIGHT;
+            else if (pt_name == "silver")      t = SILVER;
+            else if (pt_name == "gold")        t = GOLD;
+            else if (pt_name == "bishop")      t = BISHOP;
+            else if (pt_name == "rook")        t = ROOK;
+            else if (pt_name == "prom_pawn")   t = PROM_PAWN;
+            else if (pt_name == "prom_lance")  t = PROM_LANCE;
+            else if (pt_name == "prom_knight") t = PROM_KNIGHT;
+            else if (pt_name == "prom_silver") t = PROM_SILVER;
+            else if (pt_name == "prom_bishop") t = PROM_BISHOP;
+            else if (pt_name == "prom_rook")   t = PROM_ROOK;
+            if (t != NO_PT) { loaded.piece_value[t] = parsed; loaded_values++; }
+        }
+    }
+
+    (void)family_declared; // used only for model_type detection above
+
+    if (loaded_values == 0) {
+        if (!is_auto) {
+            g_status = "kpp: built-in fallback (parse error: " + path + ")";
+            g_family = EvalFamily::FALLBACK;
+        }
+        return false;
+    }
+
+    g_params = loaded;
+    const std::string tag = is_auto ? "auto-discovered" : "explicit";
+    g_status = "kpp: loaded from " + path + " [" + tag + "]";
+    g_family = EvalFamily::KPP;
+    return true;
+}
+
+// -----------------------------------------------------------------------
+// Load on first use (lazy, called before every evaluate() call).
+// Priority:
+//   1. Explicit path set via set_eval_file_path(non-empty)
+//   2. SHOGIAI_EVAL_FILE environment variable
+//   3. Auto-discovery (DISCOVERY_CANDIDATES in order)
+//   4. Built-in KPP fallback
+// -----------------------------------------------------------------------
 void try_load_eval_file_once() {
     if (g_loaded_once) return;
     g_loaded_once = true;
 
-    const char* env_path = std::getenv("SHOGIAI_EVAL_FILE");
-    if (env_path && *env_path) g_eval_file_path = env_path;
-
-    std::ifstream ifs(g_eval_file_path);
-    if (!ifs) {
-        g_status = std::string("built-in KPP fallback (eval file not found: ") + g_eval_file_path + ")";
+    // Priority 1: explicit setoption / set_eval_file_path
+    if (g_explicit_path && !g_eval_file_path.empty()) {
+        try_load_from_path(g_eval_file_path, /*is_auto=*/false);
         return;
     }
 
-    EvalParams loaded = g_params;
-    std::string line;
-    int loaded_values = 0;
-    while (std::getline(ifs, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = line.substr(0, eq);
-        const std::string val = line.substr(eq + 1);
-        int parsed = 0;
-        std::istringstream iss(val);
-        if (!(iss >> parsed)) continue;
-
-        if (key == "kpp_weight") { loaded.kpp_weight = parsed; loaded_values++; continue; }
-        if (key == "king_zone_bonus") { loaded.king_zone_bonus = parsed; loaded_values++; continue; }
-        if (key.rfind("piece_", 0) == 0) {
-            const std::string pt = key.substr(6);
-            PieceType t = NO_PT;
-            if      (pt == "pawn") t = PAWN;
-            else if (pt == "lance") t = LANCE;
-            else if (pt == "knight") t = KNIGHT;
-            else if (pt == "silver") t = SILVER;
-            else if (pt == "gold") t = GOLD;
-            else if (pt == "bishop") t = BISHOP;
-            else if (pt == "rook") t = ROOK;
-            else if (pt == "prom_pawn") t = PROM_PAWN;
-            else if (pt == "prom_lance") t = PROM_LANCE;
-            else if (pt == "prom_knight") t = PROM_KNIGHT;
-            else if (pt == "prom_silver") t = PROM_SILVER;
-            else if (pt == "prom_bishop") t = PROM_BISHOP;
-            else if (pt == "prom_rook") t = PROM_ROOK;
-            if (t != NO_PT) {
-                loaded.piece_value[t] = parsed;
-                loaded_values++;
-            }
+    // Priority 2: environment variable (explicit but lower than setoption)
+    {
+        const char* env_path = std::getenv("SHOGIAI_EVAL_FILE");
+        if (env_path && *env_path) {
+            try_load_from_path(std::string(env_path), /*is_auto=*/false);
+            return;
         }
     }
 
-    if (loaded_values == 0) {
-        g_status = std::string("built-in KPP fallback (invalid eval file: ") + g_eval_file_path + ")";
-        return;
+    // Priority 3: auto-discovery
+    for (const char* candidate : DISCOVERY_CANDIDATES) {
+        bool ok = try_load_from_path(candidate, /*is_auto=*/true);
+        if (ok || g_family == EvalFamily::NNUE_UNSUPPORTED) {
+            // Stop on success OR on an explicitly identified unsupported file.
+            return;
+        }
     }
-    g_params = loaded;
-    g_status = std::string("external eval loaded from ") + g_eval_file_path;
+
+    // Priority 4: built-in fallback
+    g_status = "kpp: built-in fallback"
+               " (no compatible eval file found;"
+               " auto-discovery checked: src/eval/kpp_weights.txt,"
+               " eval/kpp_weights.txt)";
+    g_family = EvalFamily::FALLBACK;
 }
 
 } // namespace
 
+// ============================================================
+// Public API
+// ============================================================
+
 void set_eval_file_path(const std::string& path) {
-    g_eval_file_path = path.empty() ? DEFAULT_EVAL_FILE : path;
-    g_loaded_once = false;
-    g_status = "built-in KPP fallback";
+    g_eval_file_path  = path;
+    g_explicit_path   = !path.empty();
+    g_loaded_once     = false;
+    g_params          = EvalParams{};
+    g_status          = "kpp: built-in fallback";
+    g_family          = EvalFamily::FALLBACK;
 }
 
 std::string eval_status_message() {
     try_load_eval_file_once();
     return g_status;
+}
+
+EvalFamily get_eval_family() {
+    try_load_eval_file_once();
+    return g_family;
 }
 
 int evaluate(const Board& board) {
@@ -162,3 +288,4 @@ int evaluate(const Board& board) {
 
     return score;
 }
+
