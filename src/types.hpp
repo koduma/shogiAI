@@ -53,8 +53,28 @@ enum PieceType : int {
     PT_NB      = 15
 };
 
-inline PieceType promote_pt  (PieceType p) { return static_cast<PieceType>(p + 8); }
-inline PieceType unpromote_pt(PieceType p) { return static_cast<PieceType>(p - 8); }
+inline PieceType promote_pt(PieceType p) {
+    switch (p) {
+        case PAWN:   return PROM_PAWN;
+        case LANCE:  return PROM_LANCE;
+        case KNIGHT: return PROM_KNIGHT;
+        case SILVER: return PROM_SILVER;
+        case BISHOP: return PROM_BISHOP;
+        case ROOK:   return PROM_ROOK;
+        default:     return p;
+    }
+}
+inline PieceType unpromote_pt(PieceType p) {
+    switch (p) {
+        case PROM_PAWN:   return PAWN;
+        case PROM_LANCE:  return LANCE;
+        case PROM_KNIGHT: return KNIGHT;
+        case PROM_SILVER: return SILVER;
+        case PROM_BISHOP: return BISHOP;
+        case PROM_ROOK:   return ROOK;
+        default:          return p;
+    }
+}
 inline bool is_promoted   (PieceType p) { return p >= PROM_PAWN; }
 // Can this (unpromoted) type be promoted?  Gold and King cannot.
 inline bool is_promotable (PieceType p) { return p >= PAWN && p <= ROOK && p != GOLD && p != KING; }
