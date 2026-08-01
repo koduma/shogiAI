@@ -32,8 +32,8 @@ target_include_directories(shogi_tests PRIVATE src)
 enable_testing()
 add_test(NAME shogi_tests COMMAND shogi_tests)
 
-# ---- Copy eval parameter files to build directory ----
-# This makes eval/kpp_weights.txt available relative to the build directory,
-# which matches the auto-discovery path "eval/kpp_weights.txt".
+# ---- Copy eval model directory to build directory ----
+# User-supplied src/eval/kpp.bin is copied to build/eval/kpp.bin so the runtime
+# auto-discovery path works from the build directory as well.
 # Re-run cmake to pick up changes to src/eval/ files.
 file(COPY ${CMAKE_SOURCE_DIR}/src/eval DESTINATION ${CMAKE_BINARY_DIR})

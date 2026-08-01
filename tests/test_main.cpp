@@ -7,6 +7,10 @@
 #include <cstring>
 #include <chrono>
 #include <vector>
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 
 // ============================================================
 // Minimal test framework
@@ -569,219 +573,332 @@ static void test_lmr_preserves_tactical_best_move() {
 }
 
 // ============================================================
-// Eval file: helper to write a temporary file
+// Eval file helpers
 // ============================================================
-#include <fstream>
+namespace fs = std::filesystem;
+
+constexpr uint32_t TEST_KPP_VERSION             = 1u;
+constexpr uint32_t TEST_ENDIAN_MARKER           = 0x01020304u;
+constexpr uint32_t TEST_HEADER_SIZE             = 64u;
+constexpr uint32_t TEST_STORAGE_KIND_SPARSE_I16 = 1u;
+constexpr uint32_t TEST_VALUE_TYPE_INT16        = 1u;
+constexpr uint32_t TEST_KING_SQUARE_COUNT       = 81u;
+constexpr uint32_t TEST_ENTRY_BYTES             = 8u;
+constexpr int      TEST_BOARD_FEATURE_COUNT     = 2 * 13 * 81;
+constexpr int      TEST_HAND_FEATURES_PER_COLOR = 38;
+constexpr int      TEST_FEATURE_COUNT           = TEST_BOARD_FEATURE_COUNT + 2 * TEST_HAND_FEATURES_PER_COLOR;
+
+struct TestRelationEntry {
+    uint16_t king_sq;
+    uint16_t feature_a;
+    uint16_t feature_b;
+    int16_t value;
+};
 
 static void write_tmp_file(const std::string& path, const std::string& contents) {
-    std::ofstream f(path);
+    std::ofstream f(path, std::ios::binary);
     f << contents;
 }
 
-// ============================================================
-// Test: explicit KPP eval file is loaded and status reflects it
-// ============================================================
-static void test_eval_explicit_kpp_file_loaded() {
-    const std::string tmp = "/tmp/shogiai_test_kpp_explicit.txt";
-    write_tmp_file(tmp,
-        "model_type=kpp\n"
-        "kpp_weight=12\n"
-        "piece_pawn=100\n");
+static void append_u16_le(std::vector<uint8_t>& bytes, uint16_t value) {
+    bytes.push_back(static_cast<uint8_t>(value & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+}
 
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
+static void append_i16_le(std::vector<uint8_t>& bytes, int16_t value) {
+    append_u16_le(bytes, static_cast<uint16_t>(value));
+}
 
-    CHECK(status.find("kpp: loaded") != std::string::npos);
-    CHECK(status.find("explicit") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::KPP);
+static void append_u32_le(std::vector<uint8_t>& bytes, uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8)
+        bytes.push_back(static_cast<uint8_t>((value >> shift) & 0xFFu));
+}
 
-    // Symmetry preserved after loading
+static void append_u64_le(std::vector<uint8_t>& bytes, uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8)
+        bytes.push_back(static_cast<uint8_t>((value >> shift) & 0xFFu));
+}
+
+static void set_u32_le(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
+    for (int i = 0; i < 4; ++i) bytes[offset + i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFFu);
+}
+
+static void set_u64_le(std::vector<uint8_t>& bytes, size_t offset, uint64_t value) {
+    for (int i = 0; i < 8; ++i) bytes[offset + i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFFu);
+}
+
+static uint32_t fnv1a32(const std::vector<uint8_t>& bytes, size_t offset) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = offset; i < bytes.size(); ++i) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static const std::array<int, PT_NB>& default_test_piece_values() {
+    static const std::array<int, PT_NB> values{{
+        0, 100, 300, 300, 500, 600, 800, 1000, 0, 600, 600, 600, 600, 1100, 1300
+    }};
+    return values;
+}
+
+static int test_board_feature_type_index(PieceType pt) {
+    switch (pt) {
+        case PAWN: return 0;
+        case LANCE: return 1;
+        case KNIGHT: return 2;
+        case SILVER: return 3;
+        case GOLD: return 4;
+        case BISHOP: return 5;
+        case ROOK: return 6;
+        case PROM_PAWN: return 7;
+        case PROM_LANCE: return 8;
+        case PROM_KNIGHT: return 9;
+        case PROM_SILVER: return 10;
+        case PROM_BISHOP: return 11;
+        case PROM_ROOK: return 12;
+        default: return -1;
+    }
+}
+
+static int test_board_feature_index(Piece p, Square s) {
+    const int type_index = test_board_feature_type_index(type_of(p));
+    if (type_index < 0) return -1;
+    return static_cast<int>(color_of(p)) * (13 * 81) + type_index * 81 + s;
+}
+
+static std::vector<uint8_t> make_valid_kpp_model_bytes(
+    const std::vector<TestRelationEntry>& entries,
+    const std::array<int, PT_NB>& piece_values = default_test_piece_values()) {
+
+    std::vector<uint8_t> bytes;
+    bytes.reserve(TEST_HEADER_SIZE + PT_NB * 4 + entries.size() * TEST_ENTRY_BYTES);
+
+    const char magic[] = "ShogiAI-KPP-v1";
+    for (size_t i = 0; i < 16; ++i) bytes.push_back(i < sizeof(magic) - 1 ? static_cast<uint8_t>(magic[i]) : 0u);
+    append_u32_le(bytes, TEST_KPP_VERSION);
+    append_u32_le(bytes, TEST_ENDIAN_MARKER);
+    append_u32_le(bytes, TEST_HEADER_SIZE);
+    append_u32_le(bytes, TEST_KING_SQUARE_COUNT);
+    append_u32_le(bytes, TEST_FEATURE_COUNT);
+    append_u32_le(bytes, PT_NB);
+    append_u32_le(bytes, static_cast<uint32_t>(entries.size()));
+    append_u32_le(bytes, TEST_STORAGE_KIND_SPARSE_I16);
+    append_u32_le(bytes, TEST_VALUE_TYPE_INT16);
+
+    const uint64_t payload_bytes = static_cast<uint64_t>(PT_NB * 4 + entries.size() * TEST_ENTRY_BYTES);
+    append_u64_le(bytes, payload_bytes);
+    append_u32_le(bytes, 0u); // checksum placeholder
+
+    for (int value : piece_values) append_u32_le(bytes, static_cast<uint32_t>(value));
+    for (const auto& entry : entries) {
+        append_u16_le(bytes, entry.king_sq);
+        append_u16_le(bytes, entry.feature_a);
+        append_u16_le(bytes, entry.feature_b);
+        append_i16_le(bytes, entry.value);
+    }
+
+    set_u32_le(bytes, 60, fnv1a32(bytes, TEST_HEADER_SIZE));
+    return bytes;
+}
+
+static void write_binary_file(const std::string& path, const std::vector<uint8_t>& bytes) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+static TestRelationEntry make_relation(Square king_sq, int feature_a, int feature_b, int16_t value) {
+    const int lo = std::min(feature_a, feature_b);
+    const int hi = std::max(feature_a, feature_b);
+    return TestRelationEntry{
+        static_cast<uint16_t>(king_sq),
+        static_cast<uint16_t>(lo),
+        static_cast<uint16_t>(hi),
+        value
+    };
+}
+
+static Board make_two_piece_test_board(const std::string& sfen) {
     Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
-
-    set_eval_file_path(""); // reset
+    b.parse_sfen(sfen);
+    return b;
 }
 
-// ============================================================
-// Test: explicit path overrides auto-discovery
-// ============================================================
-static void test_eval_explicit_overrides_auto() {
-    const std::string tmp = "/tmp/shogiai_test_explicit_override.txt";
-    // Use a different kpp_weight to confirm this file is actually loaded
-    write_tmp_file(tmp,
-        "model_type=kpp\n"
-        "kpp_weight=20\n"
-        "piece_pawn=100\n"
-        "piece_lance=300\n"
-        "piece_knight=300\n"
-        "piece_silver=500\n"
-        "piece_gold=600\n"
-        "piece_bishop=800\n"
-        "piece_rook=1000\n"
-        "piece_prom_pawn=600\n"
-        "piece_prom_lance=600\n"
-        "piece_prom_knight=600\n"
-        "piece_prom_silver=600\n"
-        "piece_prom_bishop=1100\n"
-        "piece_prom_rook=1300\n");
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-    CHECK(status.find("explicit") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    // The auto-discovery candidates are NOT mentioned in the status
-    CHECK(status.find("auto-discovery") == std::string::npos);
-
-    set_eval_file_path(""); // reset
+static void remove_if_exists(const fs::path& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
 }
 
-// ============================================================
-// Test: NNUE model_type file is recognized as unsupported,
-//       engine stays functional with KPP fallback
-// ============================================================
-static void test_eval_nnue_unsupported_fallback() {
-    const std::string tmp = "/tmp/shogiai_test_nnue.txt";
-    write_tmp_file(tmp, "model_type=nnue\n");
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("unsupported evaluator: nnue") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::NNUE_UNSUPPORTED);
-
-    // Engine must still return a sensible (non-crash) evaluation
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0); // symmetric position → 0 regardless of params
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: file-not-found status and EvalFamily FALLBACK
-// ============================================================
-static void test_eval_file_not_found() {
-    set_eval_file_path("/tmp/shogiai_nonexistent_file_99999.txt");
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("file not found") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::FALLBACK);
-
-    // Engine must still work
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: parse-error status (file exists but has no valid keys)
-// ============================================================
-static void test_eval_parse_error_status() {
-    const std::string tmp = "/tmp/shogiai_test_comments_only.txt";
-    write_tmp_file(tmp, "# only a comment\n# another comment\n");
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("parse error") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::FALLBACK);
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: loading a KPP file with a modified piece_pawn value
-//       actually changes the evaluation result
-// ============================================================
-static void test_eval_custom_piece_value_applied() {
-    const std::string tmp = "/tmp/shogiai_test_pawn200.txt";
-    write_tmp_file(tmp,
-        "model_type=kpp\n"
-        "piece_pawn=200\n"   // doubled pawn value
-        "piece_lance=300\n"
-        "piece_knight=300\n"
-        "piece_silver=500\n"
-        "piece_gold=600\n"
-        "piece_bishop=800\n"
-        "piece_rook=1000\n"
-        "piece_prom_pawn=600\n"
-        "piece_prom_lance=600\n"
-        "piece_prom_knight=600\n"
-        "piece_prom_silver=600\n"
-        "piece_prom_bishop=1100\n"
-        "piece_prom_rook=1300\n");
-
-    set_eval_file_path(tmp);
-
-    // 1 black pawn in hand → score should reflect the 200-cp pawn value
-    Board b;
-    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
-    const int score = evaluate(b);
-    CHECK(score >= 200); // must be at least one 200-cp pawn advantage
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: auto-discovery finds eval/kpp_weights.txt in build dir
-//       (CMake copies src/eval/ → build/eval/ at configure time)
-// ============================================================
-static void test_eval_auto_discovery() {
-    // Reset to auto-discovery mode (no explicit path).
+static void test_material_fallback_without_model() {
+    remove_if_exists("eval/kpp.bin");
+    remove_if_exists("eval/nn.bin");
     set_eval_file_path("");
     const std::string status = eval_status_message();
+    CHECK(status.find("material-only fallback") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
 
-    // Two acceptable outcomes:
-    //   (a) auto-discovered the build-dir copy: "kpp: loaded from ... [auto-discovered]"
-    //   (b) no file found: "kpp: built-in fallback ..."
-    // Both must NOT claim "unsupported evaluator" and must NOT crash.
-    CHECK(status.find("unsupported evaluator") == std::string::npos);
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
+}
 
-    const EvalFamily fam = get_eval_family();
-    CHECK(fam == EvalFamily::KPP || fam == EvalFamily::FALLBACK);
+static void test_eval_explicit_kpp_table_loaded() {
+    const std::string tmp = "/tmp/shogiai_test_kpp_explicit.bin";
+    const int black_pawn = test_board_feature_index(make_piece(BLACK, PAWN), sq("5e"));
+    const int white_pawn = test_board_feature_index(make_piece(WHITE, PAWN), sq("6d"));
+    write_binary_file(tmp, make_valid_kpp_model_bytes({make_relation(sq("5i"), black_pawn, white_pawn, 37)}));
 
-    // Evaluation must remain valid and symmetric
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+    CHECK(status.find("kpp table: loaded") != std::string::npos);
+    CHECK(status.find("explicit") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::KPP_TABLE);
+
+    Board b = make_two_piece_test_board("4k4/9/9/3p5/4P4/9/9/9/4K4 b - 1");
+    CHECK_EQ(evaluate(b), 37);
+
+    b.parse_sfen("4k4/9/9/3p5/4P4/9/9/9/4K4 w - 1");
+    CHECK_EQ(evaluate(b), -37);
+
+    set_eval_file_path("");
+}
+
+static void test_eval_kpp_table_depends_on_king_square() {
+    const std::string tmp = "/tmp/shogiai_test_kpp_king.bin";
+    const int black_pawn = test_board_feature_index(make_piece(BLACK, PAWN), sq("5e"));
+    const int white_pawn = test_board_feature_index(make_piece(WHITE, PAWN), sq("6d"));
+    write_binary_file(tmp, make_valid_kpp_model_bytes({make_relation(sq("5i"), black_pawn, white_pawn, 37)}));
+
+    set_eval_file_path(tmp);
+    Board matching = make_two_piece_test_board("4k4/9/9/3p5/4P4/9/9/9/4K4 b - 1");
+    Board shifted  = make_two_piece_test_board("4k4/9/9/3p5/4P4/9/9/9/3K5 b - 1");
+    CHECK_EQ(evaluate(matching), 37);
+    CHECK_EQ(evaluate(shifted), 0);
+    set_eval_file_path("");
+}
+
+static void test_eval_explicit_overrides_auto() {
+    std::error_code ec;
+    fs::create_directories("eval", ec);
+
+    const int black_pawn = test_board_feature_index(make_piece(BLACK, PAWN), sq("5e"));
+    const int white_pawn = test_board_feature_index(make_piece(WHITE, PAWN), sq("6d"));
+    write_binary_file("eval/kpp.bin", make_valid_kpp_model_bytes({make_relation(sq("5i"), black_pawn, white_pawn, 11)}));
+
+    const std::string tmp = "/tmp/shogiai_test_explicit_override.bin";
+    write_binary_file(tmp, make_valid_kpp_model_bytes({make_relation(sq("5i"), black_pawn, white_pawn, 37)}));
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+    CHECK(status.find("explicit") != std::string::npos);
+    CHECK(status.find(tmp) != std::string::npos);
+    CHECK(status.find("auto-discovered") == std::string::npos);
+
+    Board b = make_two_piece_test_board("4k4/9/9/3p5/4P4/9/9/9/4K4 b - 1");
+    CHECK_EQ(evaluate(b), 37);
+
+    set_eval_file_path("");
+    remove_if_exists("eval/kpp.bin");
+}
+
+static void test_eval_auto_discovery_kpp_table() {
+    std::error_code ec;
+    fs::create_directories("eval", ec);
+
+    const int black_pawn = test_board_feature_index(make_piece(BLACK, PAWN), sq("5e"));
+    const int white_pawn = test_board_feature_index(make_piece(WHITE, PAWN), sq("6d"));
+    write_binary_file("eval/kpp.bin", make_valid_kpp_model_bytes({make_relation(sq("5i"), black_pawn, white_pawn, 11)}));
+
+    set_eval_file_path("");
+    const std::string status = eval_status_message();
+    CHECK(status.find("auto-discovered") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::KPP_TABLE);
+
+    Board b = make_two_piece_test_board("4k4/9/9/3p5/4P4/9/9/9/4K4 b - 1");
+    CHECK_EQ(evaluate(b), 11);
+
+    remove_if_exists("eval/kpp.bin");
+    set_eval_file_path("");
+}
+
+static void test_eval_nnue_unsupported_fallback() {
+    const std::string tmp = "/tmp/nn.bin";
+    write_tmp_file(tmp, "not-a-kpp-model\n");
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+    CHECK(status.find("nnue unsupported") != std::string::npos);
+    CHECK(status.find("material-only fallback") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::NNUE_UNSUPPORTED);
+
     Board b;
     b.set_startpos();
     CHECK_EQ(evaluate(b), 0);
 
-    set_eval_file_path(""); // ensure reset for subsequent tests
+    set_eval_file_path("");
 }
 
-// ============================================================
-// Test: three-piece-relation alias accepted as KPP
-// ============================================================
-static void test_eval_three_piece_relation_alias() {
-    const std::string tmp = "/tmp/shogiai_test_tpr.txt";
-    write_tmp_file(tmp,
-        "model_type=three-piece-relation\n"
-        "kpp_weight=12\n"
-        "piece_pawn=100\n"
-        "piece_lance=300\n"
-        "piece_knight=300\n"
-        "piece_silver=500\n"
-        "piece_gold=600\n"
-        "piece_bishop=800\n"
-        "piece_rook=1000\n"
-        "piece_prom_pawn=600\n"
-        "piece_prom_lance=600\n"
-        "piece_prom_knight=600\n"
-        "piece_prom_silver=600\n"
-        "piece_prom_bishop=1100\n"
-        "piece_prom_rook=1300\n");
+static void test_eval_invalid_models_are_rejected() {
+    const int black_pawn = test_board_feature_index(make_piece(BLACK, PAWN), sq("5e"));
+    const int white_pawn = test_board_feature_index(make_piece(WHITE, PAWN), sq("6d"));
+    const auto valid = make_valid_kpp_model_bytes({make_relation(sq("5i"), black_pawn, white_pawn, 37)});
 
-    set_eval_file_path(tmp);
+    {
+        auto bytes = valid;
+        bytes[0] = 'X';
+        const std::string path = "/tmp/shogiai_invalid_magic.bin";
+        write_binary_file(path, bytes);
+        set_eval_file_path(path);
+        CHECK(eval_status_message().find("invalid ShogiAI-KPP-v1") != std::string::npos);
+        CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+    }
+
+    {
+        auto bytes = valid;
+        set_u32_le(bytes, 32, TEST_FEATURE_COUNT + 1);
+        const std::string path = "/tmp/shogiai_invalid_feature_count.bin";
+        write_binary_file(path, bytes);
+        set_eval_file_path(path);
+        CHECK(eval_status_message().find("feature count mismatch") != std::string::npos);
+        CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+    }
+
+    {
+        auto bytes = valid;
+        bytes.pop_back();
+        const std::string path = "/tmp/shogiai_truncated.bin";
+        write_binary_file(path, bytes);
+        set_eval_file_path(path);
+        CHECK(eval_status_message().find("truncated") != std::string::npos);
+        CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+    }
+
+    {
+        auto bytes = valid;
+        set_u64_le(bytes, 52, 1ull << 40);
+        const std::string path = "/tmp/shogiai_oversized.bin";
+        write_binary_file(path, bytes);
+        set_eval_file_path(path);
+        CHECK(eval_status_message().find("payload too large") != std::string::npos ||
+              eval_status_message().find("maximum supported payload size") != std::string::npos);
+        CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+    }
+
+    set_eval_file_path("");
+}
+
+static void test_eval_file_not_found() {
+    set_eval_file_path("/tmp/shogiai_nonexistent_file_99999.bin");
     const std::string status = eval_status_message();
+    CHECK(status.find("file not found") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
 
-    CHECK(status.find("kpp: loaded") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::KPP);
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
 
-    set_eval_file_path(""); // reset
+    set_eval_file_path("");
 }
 
 
@@ -818,14 +935,14 @@ int main() {
     test_lmr_preserves_tactical_best_move();
 
     // Eval file discovery and loading tests
-    test_eval_explicit_kpp_file_loaded();
+    test_material_fallback_without_model();
+    test_eval_explicit_kpp_table_loaded();
+    test_eval_kpp_table_depends_on_king_square();
     test_eval_explicit_overrides_auto();
+    test_eval_auto_discovery_kpp_table();
     test_eval_nnue_unsupported_fallback();
+    test_eval_invalid_models_are_rejected();
     test_eval_file_not_found();
-    test_eval_parse_error_status();
-    test_eval_custom_piece_value_applied();
-    test_eval_auto_discovery();
-    test_eval_three_piece_relation_alias();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "
