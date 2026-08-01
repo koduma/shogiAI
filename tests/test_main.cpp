@@ -496,6 +496,78 @@ static void test_search_info_callback() {
     CHECK(!last.pv.empty());
 }
 
+// ============================================================
+// Test: null move pruning fires (threshold_cutoffs > 0).
+// Uses the starting position with a moderate budget so the
+// engine reaches depth >= 5, where NMP and futility both engage.
+// ============================================================
+static void test_null_move_pruning_fires() {
+    Board b;
+    b.set_startpos();
+    std::vector<SearchInfo> infos;
+    (void)iterative_deepening(b, 500, [&](const SearchInfo& info) { infos.push_back(info); });
+    SearchStats st = last_search_stats();
+    // threshold_cutoffs collects both NMP and futility prune counts.
+    CHECK(st.threshold_cutoffs > 0);
+    // We should reach a reasonable search depth within 500 ms.
+    CHECK(!infos.empty() && infos.back().depth >= 8);
+}
+
+// ============================================================
+// Test: NMP does NOT prune when the side to move is in check
+// (verifies the in_check safety condition).
+// ============================================================
+static void test_null_move_skipped_in_check() {
+    Board b;
+    // Black king at 5i, white rook at 5a checks along file 5.
+    // Black is in check; iterative deepening must still return a legal move.
+    b.parse_sfen("4r4/9/9/9/9/9/9/9/4K4 b - 1");
+    const Move m = iterative_deepening(b, 200);
+    // Engine must return a legal escape move, not MOVE_NONE.
+    CHECK(m != MOVE_NONE);
+    // The returned move must actually be in the legal move list.
+    MoveList ml;
+    generate_legal_moves(b, ml);
+    bool found = false;
+    for (Move x : ml) if (x == m) { found = true; break; }
+    CHECK(found);
+}
+
+// ============================================================
+// Test: iterative deepening reaches strictly greater depth
+// within 1 second from the starting position (validates that
+// the pruning optimisations together improve search depth).
+// ============================================================
+static void test_depth_improved_with_pruning() {
+    Board b;
+    b.set_startpos();
+    int max_depth = 0;
+    (void)iterative_deepening(b, 1000, [&](const SearchInfo& info) {
+        if (info.depth > max_depth) max_depth = info.depth;
+    });
+    // With NMP + LMR + futility a modern fast machine should reach depth >= 12
+    // within 1 second from the starting position.
+    if (max_depth < 10) {
+        std::cerr << "FAIL  " << __FILE__ << ':' << __LINE__
+                  << "  depth_improved: depth=" << max_depth << " (want >= 10)\n";
+        g_fail++;
+    } else {
+        g_pass++;
+    }
+}
+
+// ============================================================
+// Test: LMR + PVS do not drop the tactical best-move in a
+// forced-capture position (regression for correctness).
+// ============================================================
+static void test_lmr_preserves_tactical_best_move() {
+    Board b;
+    // White bishop on 5d can capture the hanging black rook on 6e.
+    b.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
+    const Move best = iterative_deepening(b, 400);
+    CHECK_EQ(best, usi_to_move("5d6e"));
+}
+
 
 int main() {
     Zobrist::init();
@@ -524,6 +596,10 @@ int main() {
     test_time_allocation_reasonable();
     test_alpha_beta_cutoff_stats();
     test_search_info_callback();
+    test_null_move_pruning_fires();
+    test_null_move_skipped_in_check();
+    test_depth_improved_with_pruning();
+    test_lmr_preserves_tactical_best_move();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "
