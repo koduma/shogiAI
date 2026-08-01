@@ -120,7 +120,7 @@ int main() {
             // Time management
             int allotted_ms;
             if (movetime > 0) {
-                allotted_ms = movetime - 10;  // small safety margin
+                allotted_ms = std::max(1, movetime - 10);  // small safety margin
             } else if (infinite) {
                 allotted_ms = 60 * 1000;      // search for up to 60 s then return best
             } else {

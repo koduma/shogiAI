@@ -44,6 +44,7 @@ public:
     Color    side_to_move()          const { return stm_; }
     int      hand        (Color c, PieceType pt) const { return hand_[c][pt]; }
     Square   king_sq     (Color c)   const { return king_sq_[c]; }
+    uint64_t hash        ()          const { return hash_; }
 
     // Attack / check detection
     bool is_attacked(Square sq, Color by) const;

@@ -8,10 +8,6 @@
 constexpr int INF       = 1'000'000;
 constexpr int MATE_VALUE= 900'000;   // returned for checkmate/no-moves
 constexpr int MAX_DEPTH = 64;
-// 4000cp is far above normal positional swings in this engine's scale (piece values ~100-1300),
-// so only clearly one-sided nodes are treated as +/-INF for early pruning stability.
-constexpr int PRUNE_LOSS_THRESHOLD_CP = 4000; // A: max側で eval <= -A なら -INF 扱い
-constexpr int PRUNE_WIN_THRESHOLD_CP  = 4000; // B: min側で eval >= +B なら +INF 扱い
 
 // Global stop flag (set by USI "stop" command or when time expires)
 extern std::atomic<bool> g_stop;
@@ -30,8 +26,12 @@ struct SearchInfo {
 
 struct SearchStats {
     uint64_t nodes = 0;
+    uint64_t qnodes = 0;
     uint64_t beta_cutoffs = 0;
     uint64_t threshold_cutoffs = 0;
+    uint64_t tt_probes = 0;
+    uint64_t tt_hits = 0;
+    uint64_t tt_cutoffs = 0;
 };
 
 // Start the clock for a search
