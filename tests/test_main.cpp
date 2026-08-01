@@ -42,6 +42,12 @@ static Square sq(const char* usi) {          // e.g. "5e"
     return usi_to_sq(usi[0], usi[1]);
 }
 
+static bool has_move_usi(const MoveList& ml, const char* usi) {
+    Move m = usi_to_move(usi);
+    for (Move x : ml) if (x == m) return true;
+    return false;
+}
+
 // ============================================================
 // Test: square / USI conversions
 // ============================================================
@@ -263,6 +269,36 @@ static void test_king_cant_move_into_check() {
 }
 
 // ============================================================
+// Test: promoted bishop (horse) movement regression
+// ============================================================
+static void test_horse_movement_regression() {
+    Board b;
+    b.parse_sfen("4k4/9/9/9/9/9/9/8K/2r1+B4 b - 1");
+
+    CHECK(b.piece_at(sq("5i")) == make_piece(BLACK, PROM_BISHOP));
+
+    MoveList ml;
+    generate_legal_moves(b, ml);
+
+    // Regression: horse must not move two squares orthogonally.
+    CHECK(!has_move_usi(ml, "5i7i"));
+
+    // Legal horse moves should still exist.
+    CHECK(has_move_usi(ml, "5i6i"));
+    CHECK(has_move_usi(ml, "5i6h"));
+}
+
+// ============================================================
+// Test: bishop/rook promotion mapping is correct
+// ============================================================
+static void test_major_promotion_mapping() {
+    CHECK_EQ(promote_pt(BISHOP), PROM_BISHOP);
+    CHECK_EQ(promote_pt(ROOK), PROM_ROOK);
+    CHECK_EQ(unpromote_pt(PROM_BISHOP), BISHOP);
+    CHECK_EQ(unpromote_pt(PROM_ROOK), ROOK);
+}
+
+// ============================================================
 // Test: move_to_usi / usi_to_move round-trip
 // ============================================================
 static void test_move_usi_roundtrip() {
@@ -475,6 +511,8 @@ int main() {
     test_nifu();
     test_check_detection();
     test_king_cant_move_into_check();
+    test_horse_movement_regression();
+    test_major_promotion_mapping();
     test_move_usi_roundtrip();
     test_eval_symmetric();
     test_eval_features();
