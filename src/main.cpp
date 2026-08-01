@@ -1,6 +1,7 @@
 #include "board.hpp"
 #include "movegen.hpp"
 #include "search.hpp"
+#include "eval.hpp"
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -31,13 +32,31 @@ int main() {
         if (cmd == "usi") {
             std::cout << "id name ShogiEngine\n";
             std::cout << "id author ShogiAI\n";
+            std::cout << "option name EvalFile type string default eval/kpp_weights.txt\n";
             std::cout << "usiok\n";
             std::cout.flush();
 
         // ---- isready ----
         } else if (cmd == "isready") {
+            (void)eval_status_message();
             std::cout << "readyok\n";
             std::cout.flush();
+
+        // ---- setoption ----
+        } else if (cmd == "setoption") {
+            std::string tok, name, value;
+            iss >> tok; // "name"
+            while (iss >> tok && tok != "value") {
+                if (!name.empty()) name += ' ';
+                name += tok;
+            }
+            while (iss >> tok) {
+                if (!value.empty()) value += ' ';
+                value += tok;
+            }
+            if (name == "EvalFile") {
+                set_eval_file_path(value);
+            }
 
         // ---- usinewgame ----
         } else if (cmd == "usinewgame") {
@@ -115,7 +134,22 @@ int main() {
                 }
             }
 
-            Move best = iterative_deepening(board, allotted_ms);
+            std::cout << "info string " << eval_status_message() << "\n";
+            std::cout.flush();
+
+            Move best = iterative_deepening(board, allotted_ms, [](const SearchInfo& info) {
+                std::cout << "info depth " << info.depth
+                          << " seldepth " << info.seldepth
+                          << " time " << info.time_ms
+                          << " nodes " << info.nodes
+                          << " nps " << info.nps << " score ";
+                if (info.score_is_mate) std::cout << "mate " << info.score_mate;
+                else                    std::cout << "cp " << info.score_cp;
+                std::cout << " pv";
+                for (Move m : info.pv) std::cout << ' ' << move_to_usi(m);
+                std::cout << "\n";
+                std::cout.flush();
+            });
 
             if (best == MOVE_NONE) {
                 std::cout << "bestmove resign\n";

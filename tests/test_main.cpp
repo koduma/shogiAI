@@ -6,6 +6,7 @@
 #include <string>
 #include <cstring>
 #include <chrono>
+#include <vector>
 
 // ============================================================
 // Minimal test framework
@@ -292,6 +293,28 @@ static void test_eval_symmetric() {
 }
 
 // ============================================================
+// Test: evaluation handles side-to-move, promotions and hand pieces
+// ============================================================
+static void test_eval_features() {
+    Board b1;
+    b1.parse_sfen("9/9/9/9/4P4/9/9/4K4/4k4 b - 1");
+    int s_black = evaluate(b1);
+    b1.parse_sfen("9/9/9/9/4P4/9/9/4K4/4k4 w - 1");
+    int s_white = evaluate(b1);
+    CHECK_EQ(s_black, -s_white);
+
+    Board b2;
+    b2.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
+    CHECK(evaluate(b2) > 0);
+
+    Board b3;
+    b3.parse_sfen("9/4+P4/9/9/9/9/9/4K4/4k4 b - 1");
+    Board b4;
+    b4.parse_sfen("9/4P4/9/9/9/9/9/4K4/4k4 b - 1");
+    CHECK(evaluate(b3) > evaluate(b4));
+}
+
+// ============================================================
 // Test: search timing - engine must not far exceed the movetime budget
 // ============================================================
 static void test_search_respects_movetime() {
@@ -346,6 +369,34 @@ static void test_time_allocation_reasonable() {
     CHECK_EQ(compute_allotted_ms(1000, 30000), 5000);
 }
 
+// ============================================================
+// Test: alpha-beta pruning statistics
+// ============================================================
+static void test_alpha_beta_cutoff_stats() {
+    Board b;
+    // Capturing-heavy position to trigger move-ordering based cuts.
+    b.parse_sfen("4k4/9/9/9/4r4/4R4/9/9/4K4 b - 1");
+    (void)negamax(b, 3, -500, 500, 0);
+    SearchStats st = last_search_stats();
+    CHECK(st.beta_cutoffs + st.threshold_cutoffs > 0);
+}
+
+// ============================================================
+// Test: search info callback provides USI info fields
+// ============================================================
+static void test_search_info_callback() {
+    Board b;
+    b.set_startpos();
+    std::vector<SearchInfo> infos;
+    (void)iterative_deepening(b, 120, [&](const SearchInfo& info) { infos.push_back(info); });
+    CHECK(!infos.empty());
+    const SearchInfo& last = infos.back();
+    CHECK(last.depth >= 1);
+    CHECK(last.time_ms >= 1);
+    CHECK(last.nodes > 0);
+    CHECK(!last.pv.empty());
+}
+
 
 int main() {
     Zobrist::init();
@@ -363,8 +414,11 @@ int main() {
     test_king_cant_move_into_check();
     test_move_usi_roundtrip();
     test_eval_symmetric();
+    test_eval_features();
     test_search_respects_movetime();
     test_time_allocation_reasonable();
+    test_alpha_beta_cutoff_stats();
+    test_search_info_callback();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "

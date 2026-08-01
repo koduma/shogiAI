@@ -11,8 +11,8 @@ compatible shogi GUI (Shogidroid, ShogiGUI, etc.).
 | Area | What's implemented |
 |---|---|
 | **Rules** | Full 9×9 board, all piece types & promotions, drops, check/checkmate detection, nifu (two-pawn) rule, pawn-drop-mate ban, forced-promotion zones |
-| **Search** | Iterative-deepening alpha-beta (negamax), basic MVV-LVA move ordering |
-| **Evaluation** | Material count (centipawn values), symmetric |
+| **Search** | Iterative-deepening alpha-beta, MVV-LVA move ordering, pruning stats, USI info output |
+| **Evaluation** | Material + lightweight KPP-style (King-Piece-Piece) interaction, optional external eval parameter file |
 | **Protocol** | USI: `usi`, `isready`, `position startpos/sfen`, `go`, `stop`, `quit` |
 | **Repetition** | Sennichite detection via Zobrist hashing (returns draw score) |
 
@@ -68,6 +68,8 @@ isready
 readyok
 position startpos
 go movetime 2000
+info depth 1 seldepth 1 time 5 nodes 1234 nps 246800 score cp 12 pv 7g7f
+info depth 2 seldepth 4 time 19 nodes 9650 nps 507894 score cp 25 pv 7g7f 3c3d
 bestmove 7g7f
 quit
 ```
@@ -77,6 +79,8 @@ quit
 1. Open **Tool → Engines → Add**.
 2. Point it at the `shogi_engine` binary.
 3. Start a game — the engine will respond to `go` commands automatically.
+4. 読み筋/評価値表示を有効化したい場合は、ShogiGUI のエンジン情報欄で USI `info` 行を表示してください
+   （本エンジンは `depth` / `seldepth` / `time` / `nodes` / `nps` / `score cp|mate` / `pv` を出力します）。
 
 #### Time management notes (ShogiGUI / Windows)
 
@@ -117,8 +121,13 @@ shogiAI/
 * **Square encoding** — `sq = rank × 9 + file`; file 0 = USI file 9 (left), file 8 = USI file 1 (right); rank 0 = rank 'a' (top).
 * **Piece encoding** — `Piece = (color << 4) | piece_type`; BLACK = 0, WHITE = 1.
 * **Undo stack** — `StateInfo` (captured piece + previous Zobrist hash) is pushed on every `do_move` and popped on `undo_move`.
-* **Evaluation** — Currently pure material; designed to be replaced with a neural-network or hand-crafted positional evaluation without touching the search or board code.
-* **Future improvements** — Transposition table, quiescence search, null-move pruning, NNUE evaluation.
+* **Evaluation** — Built-in lightweight KPP-style評価（King + Piece + Piece の関係）を使用。加えて外部評価パラメータファイルを読み込めます。
+* **Eval file format / fallback** — 既定パスは `eval/kpp_weights.txt`（`setoption name EvalFile value <path>` または `SHOGIAI_EVAL_FILE` で変更可）。  
+  ファイルが無い・不正な場合は、**安全に built-in KPP フォールバック**へ自動切替します（探索は継続）。
+* **Eval file example keys** — `kpp_weight=12`, `king_zone_bonus=6`, `piece_pawn=100`, `piece_prom_rook=1300` などの `key=value` 形式。
+* **License / source** — リポジトリ同梱コードは MIT。外部評価ファイルを利用する場合は、配布元ライセンスとの整合性を確認してください。
+* **Pruning thresholds** — しきい値 `A/B = 4000cp`（`PRUNE_LOSS_THRESHOLD_CP` / `PRUNE_WIN_THRESHOLD_CP`）を使用し、
+  極端に不利/有利な静的評価ノードをそれぞれ `-INF/+INF` 扱いにして枝刈りします。
 
 ---
 
