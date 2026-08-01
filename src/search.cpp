@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -123,7 +124,27 @@ void next_tt_generation() {
     }
 }
 
+// LMR reduction table: lmr_table[depth][searched_count]
+// Pre-computed log-based reductions.
+static int lmr_table[MAX_DEPTH][MAX_DEPTH];
+
+void init_lmr_table() {
+    for (int d = 0; d < MAX_DEPTH; ++d) {
+        for (int m = 0; m < MAX_DEPTH; ++m) {
+            if (d < 2 || m < 2)
+                lmr_table[d][m] = 0;
+            else
+                lmr_table[d][m] = static_cast<int>(0.75 + std::log(d) * std::log(m) / 2.25);
+        }
+    }
+}
+
 void reset_search_state(int allotted_ms) {
+    static bool lmr_initialized = false;
+    if (!lmr_initialized) {
+        init_lmr_table();
+        lmr_initialized = true;
+    }
     search_init_time();
     g_stop.store(false, std::memory_order_relaxed);
     g_allotted_ms = allotted_ms;
@@ -215,7 +236,8 @@ std::vector<ScoredMove> order_moves(const Board& board, const MoveList& moves, i
 
 int quiescence(Board& board, int alpha, int beta, int ply);
 
-int search(Board& board, int depth, int alpha, int beta, int ply) {
+// no_null: true when the previous move was a null move (prevents consecutive null moves).
+int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null = false) {
     if (((++g_nodes) & TIME_CHECK_MASK) == 0) {
         if (time_up(g_allotted_ms)) g_stop.store(true, std::memory_order_relaxed);
     }
@@ -229,7 +251,10 @@ int search(Board& board, int depth, int alpha, int beta, int ply) {
     if (depth <= 0) return quiescence(board, alpha, beta, ply);
 
     const int original_alpha = alpha;
-    const int original_beta = beta;
+    const int original_beta  = beta;
+    const bool in_check = board.in_check();
+    // PV node: window is wider than a null window.
+    const bool is_pv = (beta > alpha + 1);
     Move hash_move = MOVE_NONE;
 
     if (TTEntry* entry = tt_probe(board.hash())) {
@@ -246,21 +271,135 @@ int search(Board& board, int depth, int alpha, int beta, int ply) {
         }
     }
 
+    // === Reverse Futility Pruning (static null-move pruning) ===
+    // If the static evaluation exceeds beta by a depth-scaled margin, the
+    // position is likely so good that we can safely return a lower bound.
+    if (!is_pv && !in_check && depth <= 3) {
+        const int rfp_margin = 200 * depth;
+        const int static_eval = evaluate(board);
+        if (static_eval - rfp_margin >= beta)
+            return static_eval;
+    }
+
+    // === Null Move Pruning ===
+    // Skip our turn and see if the opponent can still stay below beta.
+    // Safe conditions: not PV, not in check, no consecutive null moves,
+    // depth >= 3, not a potential zugzwang (we have non-king/pawn material).
+    if (!is_pv && !in_check && !no_null && depth >= 3) {
+        // Quick material check to avoid null move in zugzwang-prone positions
+        bool has_major = false;
+        const Color us = board.side_to_move();
+        for (int pt = LANCE; pt <= ROOK && !has_major; ++pt)
+            if (board.hand(us, static_cast<PieceType>(pt)) > 0) has_major = true;
+        if (!has_major) {
+            for (int sq = 0; sq < SQUARE_NB && !has_major; ++sq) {
+                const Piece p = board.piece_at(sq);
+                if (p != NO_PIECE && color_of(p) == us) {
+                    PieceType t = type_of(p);
+                    if (t != KING && t != PAWN && t != PROM_PAWN) has_major = true;
+                }
+            }
+        }
+
+        if (has_major) {
+            const int R = 3 + depth / 6;
+
+            // Do null move: flip side to move and update hash.
+            board.stm_  = ~board.stm_;
+            board.hash_ ^= Zobrist::side;
+            board.ply_++;
+            board.pos_hashes_.push_back(board.hash_);
+
+            const int null_score = -search(board, depth - 1 - R, -beta, -beta + 1, ply + 1, true);
+
+            // Undo null move.
+            board.pos_hashes_.pop_back();
+            board.ply_--;
+            board.hash_ ^= Zobrist::side;
+            board.stm_  = ~board.stm_;
+
+            if (g_stop.load(std::memory_order_relaxed)) return 0;
+
+            // Verify: avoid returning a mate score from the null search (may be
+            // a sign of zugzwang or a TT collision near the root).
+            if (null_score >= beta && !is_mate_score(null_score)) {
+                ++g_threshold_cutoffs;
+                tt_store(board.hash(), depth, null_score, BOUND_LOWER, MOVE_NONE, ply);
+                return null_score;
+            }
+        }
+    }
+
     MoveList legal_moves;
     generate_legal_moves(board, legal_moves);
     if (legal_moves.empty()) {
-        return board.in_check() ? -(MATE_VALUE - ply) : 0;
+        return in_check ? -(MATE_VALUE - ply) : 0;
     }
+
+    // Pre-compute static eval for futility pruning (only at shallow non-PV nodes).
+    const bool use_futility = (!is_pv && !in_check && depth <= 2);
+    const int  futility_eval = use_futility ? evaluate(board) : -INF;
 
     auto ordered = order_moves(board, legal_moves, ply, hash_move, false);
     int best_score = -INF;
     Move best_move = MOVE_NONE;
+    int searched_count = 0;
 
     for (const ScoredMove& scored : ordered) {
         const Move m = scored.move;
+        const bool is_tactical = is_tactical_move(board, m);
+
+        // === Futility Pruning ===
+        // Skip quiet moves that cannot plausibly raise alpha even with a full
+        // piece gain at this shallow depth.
+        if (use_futility && searched_count >= 1 && !is_tactical) {
+            if (futility_eval + 300 * depth < alpha) {
+                ++g_threshold_cutoffs;
+                continue;
+            }
+        }
+
         board.do_move(m);
-        const int score = -search(board, depth - 1, -beta, -alpha, ply + 1);
+
+        int score;
+        if (searched_count == 0) {
+            // First move: always search with the full window.
+            score = -search(board, depth - 1, -beta, -alpha, ply + 1, false);
+        } else {
+            // === LMR (Late Move Reductions) ===
+            // Reduce quiet, non-killer, non-hash moves later in the list.
+            int lmr_depth = depth - 1;
+            bool did_lmr  = false;
+            if (!in_check && depth >= 3 && searched_count >= 2 &&
+                !is_tactical && m != hash_move &&
+                searched_count < MAX_DEPTH && depth < MAX_DEPTH) {
+                const int reduction = lmr_table[depth][searched_count];
+                if (reduction > 0) {
+                    lmr_depth = std::max(1, depth - 1 - reduction);
+                    did_lmr   = true;
+                }
+            }
+
+            // === PVS (Principal Variation Search) ===
+            // Search with a null window first.
+            score = -search(board, lmr_depth, -alpha - 1, -alpha, ply + 1, false);
+
+            // If LMR raised alpha at reduced depth, re-search at full depth
+            // with null window to confirm.
+            if (!g_stop.load(std::memory_order_relaxed) && did_lmr && score > alpha) {
+                score = -search(board, depth - 1, -alpha - 1, -alpha, ply + 1, false);
+                did_lmr = false;
+            }
+
+            // If PVS null window failed high, this looks like a new best move;
+            // re-search with the full window to get the exact score.
+            if (!g_stop.load(std::memory_order_relaxed) && score > alpha && score < beta) {
+                score = -search(board, depth - 1, -beta, -alpha, ply + 1, false);
+            }
+        }
+
         board.undo_move(m);
+        ++searched_count;
 
         if (g_stop.load(std::memory_order_relaxed)) break;
 
@@ -281,7 +420,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply) {
         alpha = std::max(alpha, best_score);
         if (alpha >= beta) {
             ++g_beta_cutoffs;
-            if (!is_tactical_move(board, m)) {
+            if (!is_tactical) {
                 record_killer(ply, m);
                 record_history(m, depth);
             }
