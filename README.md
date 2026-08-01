@@ -11,7 +11,7 @@ compatible shogi GUI (Shogidroid, ShogiGUI, etc.).
 | Area | What's implemented |
 |---|---|
 | **Rules** | Full 9×9 board, all piece types & promotions, drops, check/checkmate detection, nifu (two-pawn) rule, pawn-drop-mate ban, forced-promotion zones |
-| **Search** | Iterative-deepening alpha-beta, MVV-LVA move ordering, pruning stats, USI info output |
+| **Search** | Iterative-deepening alpha-beta, bounded transposition table, quiescence search, improved move ordering, pruning stats, USI info output |
 | **Evaluation** | Material + lightweight KPP-style (King-Piece-Piece) interaction, optional external eval parameter file |
 | **Protocol** | USI: `usi`, `isready`, `position startpos/sfen`, `go`, `stop`, `quit` |
 | **Repetition** | Sennichite detection via Zobrist hashing (returns draw score) |
@@ -108,7 +108,7 @@ shogiAI/
 │   ├── eval.hpp       # Evaluation function interface
 │   ├── eval.cpp       # Material evaluation
 │   ├── search.hpp     # Search interface + g_stop flag
-│   ├── search.cpp     # Iterative-deepening alpha-beta
+│   ├── search.cpp     # Iterative-deepening alpha-beta + TT + quiescence
 │   └── main.cpp       # USI protocol main loop
 └── tests/
     └── test_main.cpp  # Unit tests (no external framework required)
@@ -126,8 +126,10 @@ shogiAI/
   ファイルが無い・不正な場合は、**安全に built-in KPP フォールバック**へ自動切替します（探索は継続）。
 * **Eval file example keys** — `kpp_weight=12`, `king_zone_bonus=6`, `piece_pawn=100`, `piece_prom_rook=1300` などの `key=value` 形式。
 * **License / source** — リポジトリ同梱コードは MIT。外部評価ファイルを利用する場合は、配布元ライセンスとの整合性を確認してください。
-* **Pruning thresholds** — しきい値 `A/B = 4000cp`（`PRUNE_LOSS_THRESHOLD_CP` / `PRUNE_WIN_THRESHOLD_CP`）を使用し、
-  極端に不利/有利な静的評価ノードをそれぞれ `-INF/+INF` 扱いにして枝刈りします。
+* **Search details** — 盤面 Zobrist hash を使う固定サイズの置換表、capture/promotion 中心の quiescence search、
+  hash move → captures/promotions → killer moves → history heuristic の順序付けを使います。
+* **Pruning** — 以前の「静的評価だけで `±INF` を返す」しきい値枝刈りは廃止し、
+  葉では quiescence search で戦術的な取り返しや成りを確認します。
 
 ---
 

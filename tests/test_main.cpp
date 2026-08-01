@@ -315,6 +315,69 @@ static void test_eval_features() {
 }
 
 // ============================================================
+// Test: quiescence search extends tactical captures at leaf nodes
+// ============================================================
+static void test_quiescence_tactical_extension() {
+    Board b;
+    // White bishop on 5d can capture the hanging black rook on 6e.
+    b.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
+    const int static_eval = evaluate(b);
+    const int searched = negamax(b, 0, -INF, INF, 0);
+    CHECK(searched > static_eval + 300);
+}
+
+// ============================================================
+// Test: iterative search prefers the immediate tactical gain
+// ============================================================
+static void test_search_tactical_regression() {
+    Board b;
+    b.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
+
+    MoveList ml;
+    generate_legal_moves(b, ml);
+    bool found_capture = false;
+    for (Move m : ml) {
+        if (m == usi_to_move("5d6e")) found_capture = true;
+    }
+    CHECK(found_capture);
+
+    const Move best = iterative_deepening(b, 150);
+    CHECK_EQ(best, usi_to_move("5d6e"));
+}
+
+// ============================================================
+// Test: transposition table is used during iterative deepening
+// ============================================================
+static void test_transposition_table_hits() {
+    Board b;
+    b.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
+    (void)iterative_deepening(b, 150);
+    SearchStats st = last_search_stats();
+    CHECK(st.tt_probes > 0);
+    CHECK(st.tt_hits > 0);
+}
+
+// ============================================================
+// Test: root-search reset keeps deterministic stats between runs
+// ============================================================
+static void test_search_reset_deterministic() {
+    Board b1;
+    b1.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
+    const int score1 = negamax(b1, 3, -INF, INF, 0);
+    const SearchStats st1 = last_search_stats();
+
+    Board b2;
+    b2.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
+    const int score2 = negamax(b2, 3, -INF, INF, 0);
+    const SearchStats st2 = last_search_stats();
+
+    CHECK_EQ(score1, score2);
+    CHECK_EQ(st1.nodes, st2.nodes);
+    CHECK_EQ(st1.qnodes, st2.qnodes);
+    CHECK_EQ(st1.tt_hits, st2.tt_hits);
+}
+
+// ============================================================
 // Test: search timing - engine must not far exceed the movetime budget
 // ============================================================
 static void test_search_respects_movetime() {
@@ -415,6 +478,10 @@ int main() {
     test_move_usi_roundtrip();
     test_eval_symmetric();
     test_eval_features();
+    test_quiescence_tactical_extension();
+    test_search_tactical_regression();
+    test_transposition_table_hits();
+    test_search_reset_deterministic();
     test_search_respects_movetime();
     test_time_allocation_reasonable();
     test_alpha_beta_cutoff_stats();
