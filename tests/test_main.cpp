@@ -7,6 +7,8 @@
 #include <cstring>
 #include <chrono>
 #include <vector>
+#include <filesystem>
+#include <sstream>
 
 // ============================================================
 // Minimal test framework
@@ -632,6 +634,53 @@ static void write_zero_filled_file(const std::string& path, int64_t bytes) {
 // derivation of this constant from Bonanza's fe_end == 1476).
 constexpr int64_t EXPECTED_FV_BIN_BYTES = 215'824'824;
 
+// ------------------------------------------------------------------
+// Mirrors of the region layout/sizes in eval.cpp (kept in sync manually;
+// see eval.cpp for the derivation from Bonanza's fe_end == 1476), used
+// below to patch specific non-zero table entries into an otherwise
+// all-zero synthetic fv.bin so tests can assert on the *exact* numeric
+// result of evaluate() actually referencing loaded table data, rather
+// than only checking that a file of the right size is accepted.
+// ------------------------------------------------------------------
+constexpr int64_t FE_END       = 1476;
+constexpr int64_t POS_N        = FE_END * (FE_END + 1) / 2;
+constexpr int64_t SQ_NB        = 81;
+constexpr int64_t KPP_BYTES    = SQ_NB * POS_N * 2;                 // int16_t
+constexpr int64_t KKP_BYTES    = SQ_NB * SQ_NB * FE_END * 4;        // int32_t
+constexpr int64_t KK_BYTES     = SQ_NB * SQ_NB * 4;                 // int32_t
+constexpr int64_t KPP_OFFSET   = 0;
+constexpr int64_t KKP_OFFSET   = KPP_BYTES;
+constexpr int64_t KK_OFFSET    = KPP_BYTES + KKP_BYTES;
+constexpr int64_t KP_OFFSET    = KPP_BYTES + KKP_BYTES + KK_BYTES;
+
+static int64_t kpp_triangular_index(int a, int b) {
+    const int hi = std::max(a, b);
+    const int lo = std::min(a, b);
+    return static_cast<int64_t>(hi) * (hi + 1) / 2 + lo;
+}
+
+static int64_t kpp_byte_offset(int king, int fa, int fb) {
+    return KPP_OFFSET + (static_cast<int64_t>(king) * POS_N + kpp_triangular_index(fa, fb)) * 2;
+}
+static int64_t kkp_byte_offset(int king, int opp_king, int fe) {
+    return KKP_OFFSET + ((static_cast<int64_t>(king) * SQ_NB + opp_king) * FE_END + fe) * 4;
+}
+
+static void patch_int16(const std::string& path, int64_t offset, int16_t value) {
+    FILE* f = std::fopen(path.c_str(), "r+b");
+    if (!f) return;
+    std::fseek(f, static_cast<long>(offset), SEEK_SET);
+    std::fwrite(&value, sizeof(value), 1, f);
+    std::fclose(f);
+}
+static void patch_int32(const std::string& path, int64_t offset, int32_t value) {
+    FILE* f = std::fopen(path.c_str(), "r+b");
+    if (!f) return;
+    std::fseek(f, static_cast<long>(offset), SEEK_SET);
+    std::fwrite(&value, sizeof(value), 1, f);
+    std::fclose(f);
+}
+
 // ============================================================
 // Test: missing fv.bin reports material-only fallback
 // ============================================================
@@ -676,10 +725,11 @@ static void test_eval_fv_bin_size_mismatch_reports_clear_error() {
 
 // ============================================================
 // Test: an exactly-sized (all-zero-weight) fv.bin loads successfully and
-// is reported as EvalFamily::BONANZA_V6_FV. With every table entry zero,
-// evaluate() must be exactly 0 for any position (deterministic, since the
-// implemented formula is a pure sum of table lookups with no separate
-// material term once a real fv.bin is active).
+// is reported as EvalFamily::BONANZA_V6_FV, with the explicit family tag
+// present. With every KKP/KPP table entry zero, evaluate() must reduce to
+// exactly the material term (scaled and rescaled by FV_SCALE), since real
+// Bonanza always adds a separate material term on top of the relation
+// tables — it is never "implicit" in an all-zero table.
 // ============================================================
 static void test_eval_fv_bin_correct_size_loads_and_evaluates() {
     const std::string tmp = "/tmp/shogiai_test_fv_correct_size.bin";
@@ -691,14 +741,117 @@ static void test_eval_fv_bin_correct_size_loads_and_evaluates() {
     CHECK(status.find("bonanza-v6 fv.bin loaded from") != std::string::npos);
     CHECK(status.find(tmp) != std::string::npos);
     CHECK(status.find("[explicit]") != std::string::npos);
+    CHECK(status.find("[family=BONANZA_V6_FV]") != std::string::npos);
     CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
 
     Board b;
     b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
+    CHECK_EQ(evaluate(b), 0); // symmetric material, zero tables → 0
 
     b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
-    CHECK_EQ(evaluate(b), 0); // all-zero tables → always 0, regardless of material
+    CHECK_EQ(evaluate(b), 100); // one black pawn in hand: pure material (100cp), zero tables
+
+    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 w P 1");
+    CHECK_EQ(evaluate(b), -100); // same physical position, White to move → sign flips
+
+    set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
+}
+
+// ============================================================
+// Test: a hand-crafted fv.bin with a single known non-zero KKP table
+// entry (all else zero) produces the exact expected evaluate() result.
+// This is the core regression guarding against evaluate() silently
+// ignoring loaded table data (i.e. behaving identically to
+// MATERIAL_FALLBACK even though a real fv.bin was loaded).
+//
+// Position: "K8/9/9/9/4P4/9/9/9/8k b - 1"
+//   Black king  @ square 0  (Bonanza sq 0)
+//   White king  @ square 80 (Bonanza sq 80)
+//   Black pawn  @ square 40 (Bonanza sq 40)
+// With only one non-king piece, no KPP pair term can fire (a pair needs
+// at least two pieces), cleanly isolating the KKP contribution.
+// ============================================================
+static void test_eval_fv_bin_real_kkp_value_is_used() {
+    const std::string tmp = "/tmp/shogiai_test_fv_kkp_nonzero.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
+
+    // f_pawn == 81 (see eval.cpp); feature index for the black pawn as
+    // seen from Black's own point of view is f_pawn + bonanza_sq(40) = 121.
+    constexpr int kSqBk = 0, kSqWk = 80, kFeature = 81 + 40;
+    constexpr int32_t kKkpValue = 6400; // 200 centipawns * FV_SCALE(32)
+    patch_int32(tmp, kkp_byte_offset(kSqBk, kSqWk, kFeature), kKkpValue);
+
+    set_eval_file_path(tmp);
+    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
+
+    Board b;
+    b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k b - 1");
+    // material (100cp black pawn) * 32 + kkp(6400), all / 32 == 100 + 200
+    CHECK_EQ(evaluate(b), 300);
+
+    // Same physical position, White to move: sign flips exactly.
+    b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k w - 1");
+    CHECK_EQ(evaluate(b), -300);
+
+    set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
+}
+
+// ============================================================
+// Test: a hand-crafted fv.bin with two known non-zero KPP table entries
+// (the Black-view pass and the White-view/subtracted pass) produces the
+// exact expected evaluate() result, confirming the two-pass
+// opponent-mirrored KPP subtraction (not merely a single-sided sum) is
+// wired correctly, including sign, king-square mirroring and feature
+// indices for two distinct piece types (pawn + lance).
+//
+// Position: "K8/9/9/9/4P4/9/9/9/8k b - 1" plus a black lance @ square 9.
+// ============================================================
+static void test_eval_fv_bin_real_kpp_pair_value_is_used() {
+    const std::string tmp = "/tmp/shogiai_test_fv_kpp_nonzero.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
+
+    // Black-view features: lance @ bonanza_sq(9)=1 -> f_lance(225)+1=226;
+    //                       pawn  @ bonanza_sq(40)=40 -> f_pawn(81)+40=121.
+    // White-view features: lance -> e_lance(306)+mirror(1)=306+79=385;
+    //                       pawn  -> e_pawn(162)+mirror(40)=162+40=202.
+    constexpr int kSqBk = 0, kSqWkInv = 0;
+    constexpr int kBlackLance = 226, kBlackPawn = 121;
+    constexpr int kWhiteLance = 385, kWhitePawn = 202;
+    constexpr int16_t kBlackPassValue = 640; //  20 centipawns * FV_SCALE(32)
+    constexpr int16_t kWhitePassValue = 320; //  10 centipawns * FV_SCALE(32)
+
+    patch_int16(tmp, kpp_byte_offset(kSqBk, kBlackPawn, kBlackLance), kBlackPassValue);
+    patch_int16(tmp, kpp_byte_offset(kSqWkInv, kWhitePawn, kWhiteLance), kWhitePassValue);
+
+    set_eval_file_path(tmp);
+    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
+
+    Board b;
+    b.parse_sfen("K8/L8/9/9/4P4/9/9/9/8k b - 1");
+    // material (100 pawn + 300 lance = 400cp) * 32 + (640 - 320), all / 32
+    // == 400 + 10 == 410
+    CHECK_EQ(evaluate(b), 410);
+
+    set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
+}
+
+// ============================================================
+// Test: an fv.bin that is one byte short of the required size is
+// rejected exactly like any other size mismatch (boundary check), not
+// silently truncated/misread.
+// ============================================================
+static void test_eval_fv_bin_one_byte_short_is_rejected() {
+    const std::string tmp = "/tmp/shogiai_test_fv_one_byte_short.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES - 1);
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("invalid Bonanza v6 fv.bin size") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
 
     set_eval_file_path(""); // reset
     std::remove(tmp.c_str());
@@ -752,6 +905,54 @@ static void test_eval_auto_discovery() {
     set_eval_file_path(""); // ensure reset for subsequent tests
 }
 
+// ============================================================
+// Test: auto-discovery still finds a candidate fv.bin when launched from
+// an unrelated working directory (e.g. the system temp directory),
+// proving discovery is not purely cwd-relative. If discovery only ever
+// checked cwd-relative paths ("src/eval/fv.bin", "eval/fv.bin"), then
+// from an unrelated cwd every checked candidate reported in the status
+// message would be a bare relative path with no leading '/'. With the
+// fix, the executable-directory and compile-time-source-dir candidates
+// are absolute and cwd-independent, so at least one checked candidate in
+// the message must be an absolute path even when cwd is far away.
+// ============================================================
+static void test_eval_auto_discovery_independent_of_cwd() {
+    namespace fs = std::filesystem;
+    const fs::path saved_cwd = fs::current_path();
+
+    fs::current_path(fs::temp_directory_path());
+    set_eval_file_path("");
+    const std::string status = eval_status_message();
+    fs::current_path(saved_cwd);
+
+    CHECK(status.find("unsupported evaluator") == std::string::npos);
+
+    // Extract the "checked: ..." tail and verify at least one candidate
+    // path is absolute (starts with '/'), i.e. not derived solely from
+    // the (unrelated) current working directory.
+    const std::string marker = "checked: ";
+    const auto pos = status.find(marker);
+    CHECK(pos != std::string::npos);
+    bool found_absolute_candidate = false;
+    if (pos != std::string::npos) {
+        const std::string candidates = status.substr(pos + marker.size());
+        std::stringstream ss(candidates);
+        std::string candidate;
+        while (std::getline(ss, candidate, ',')) {
+            // trim a single leading space, if present
+            if (!candidate.empty() && candidate.front() == ' ')
+                candidate.erase(0, 1);
+            if (!candidate.empty() && candidate.front() == '/') {
+                found_absolute_candidate = true;
+                break;
+            }
+        }
+    }
+    CHECK(found_absolute_candidate);
+
+    set_eval_file_path(""); // ensure reset for subsequent tests
+}
+
 
 int main() {
     Zobrist::init();
@@ -791,8 +992,12 @@ int main() {
     test_eval_fv_bin_file_not_found();
     test_eval_fv_bin_size_mismatch_reports_clear_error();
     test_eval_fv_bin_correct_size_loads_and_evaluates();
+    test_eval_fv_bin_real_kkp_value_is_used();
+    test_eval_fv_bin_real_kpp_pair_value_is_used();
+    test_eval_fv_bin_one_byte_short_is_rejected();
     test_eval_nnue_unsupported_fallback();
     test_eval_auto_discovery();
+    test_eval_auto_discovery_independent_of_cwd();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "

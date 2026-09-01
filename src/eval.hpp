@@ -29,10 +29,11 @@ void set_eval_file_path(const std::string& path);
 
 // Returns a human-readable status string describing the active evaluator.
 // Examples:
-//   "bonanza-v6 fv.bin loaded from <path> [explicit]"
-//   "bonanza-v6 fv.bin loaded from <path> [auto-discovered]"
+//   "bonanza-v6 fv.bin loaded from <absolute path> [explicit] [family=BONANZA_V6_FV]"
+//   "bonanza-v6 fv.bin loaded from <absolute path> [auto-discovered] [family=BONANZA_V6_FV]"
 //   "material-only fallback (fv.bin missing)"
 //   "material-only fallback (invalid Bonanza v6 fv.bin size: got X bytes, expected Y)"
+//   "material-only fallback (no compatible fv.bin found; auto-discovery checked: ...)"
 //   "unsupported evaluator: nnue"
 std::string eval_status_message();
 

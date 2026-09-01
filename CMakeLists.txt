@@ -19,6 +19,11 @@ add_library(shogi_core STATIC
     src/search.cpp
 )
 target_include_directories(shogi_core PUBLIC src)
+# Bake the repository's absolute source directory into eval.cpp so fv.bin
+# auto-discovery has a cwd-independent, always-correct candidate path
+# (src/eval/fv.bin), regardless of where the built binary is launched
+# from. See src/eval.cpp's build_discovery_candidates().
+target_compile_definitions(shogi_core PRIVATE SHOGIAI_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # ---- USI engine executable ----
 add_executable(shogi_engine src/main.cpp)

@@ -4,9 +4,18 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <vector>
+
+#if defined(__linux__)
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
 
 // ============================================================
 // Bonanza 6.0 "fv.bin" three-piece-relation (KPP/KKP) evaluator
@@ -37,36 +46,128 @@
 // Because this sandbox does not have access to a real Bonanza 6.0 fv.bin,
 // the exact numeric weights obviously cannot be exercised or validated
 // here. What *is* validated is: (a) the file-size / structural checks
-// below, using synthetically-sized files, and (b) that an all-zero table
-// of the correct size loads and evaluates deterministically to 0. Users
-// who place their genuine fv.bin should sanity-check `eval_status_message()`
-// after startup; a size mismatch is reported explicitly rather than
-// silently mis-parsed.
+// below, using synthetically-sized files, and (b) that a hand-crafted,
+// correctly-sized fv.bin with known non-zero table entries at known
+// offsets produces exactly the expected numeric evaluate() result (see
+// tests/test_main.cpp). Users who place their genuine fv.bin should
+// sanity-check `eval_status_message()` after startup; a size mismatch is
+// reported explicitly rather than silently mis-parsed.
 //
-// The scoring formula implemented in evaluate() below is a single-sided
-// (side-to-move-perspective) reduction of the classic Bonanza summation:
-//   score = KK[my_king][opp_king]
-//         + sum_i KP [my_king][feature_i]
-//         + sum_i KKP[my_king][opp_king][feature_i]
-//         + sum_{i<j} KPP[my_king][feature_i][feature_j]
-// where `feature_i` ranges over every non-king piece (board + hand) using
-// Bonanza's f_/e_ (own/enemy) encoding, mirrored to `my_king`'s point of
-// view. This omits the reference engine's separate opponent-mirrored KPP
-// subtraction pass; it is documented here as a deliberate simplification
-// (see PR description) rather than a silent approximation, since exact
-// parity with the original dual-pass Bonanza algorithm cannot be verified
-// without the real weight file.
+// The scoring formula implemented in evaluate() below is the classic
+// Bonanza formula, NOT a re-derived approximation: it is taken directly
+// from two independent, publicly available reference implementations
+// that both agree on it exactly:
+//   - kobanium/aobazero, src/usi-engine/bona/evaluate.cpp (a near-verbatim
+//     port of the original Bonanza C source: functions evaluate()/
+//     make_list()/doapc()/doacapt()).
+//   - HiraokaTakuya/apery, src/evaluate.cpp (evaluateUnUseDiff()).
+// Both sources independently confirm: FV_SCALE == 32; the score is always
+// accumulated from BLACK's point of view and negated at the very end if
+// White is to move; only ONE KKP term is added per non-king piece (using
+// Black's own king/opponent-king squares, unmirrored, and Black's own
+// feature index); the two-piece KPP term is summed TWICE — once from
+// Black's own point of view (own king square, Black's feature list) and
+// once from White's point of view (Black-mirrored White king square,
+// White's feature list) — and the second sum is SUBTRACTED, not added;
+// and a separate material term (see FALLBACK_PIECE_VALUE below) is added
+// on top, scaled by FV_SCALE, exactly like the rest of the summation.
+// Neither reference implementation's actual evaluate() ever reads the KK
+// or KP tables at all (they exist in the raw fv.bin/converted-file layout
+// purely for structural/converter compatibility with other consumers), so
+// this implementation loads them (to validate file size/layout) but does
+// not use them when scoring, matching both reference implementations.
 
 namespace {
 
 // -----------------------------------------------------------------------
-// Automatic discovery candidates (tried in order when no explicit path is
-// set via setoption/set_eval_file_path/SHOGIAI_EVAL_FILE).
+// Path to the repository's src/eval/ directory, baked in at compile time
+// (see CMakeLists.txt: -DSHOGIAI_SOURCE_DIR="${CMAKE_SOURCE_DIR}"). This
+// gives auto-discovery an absolute, cwd-independent candidate that always
+// resolves to the same fv.bin the user placed in the checked-out source
+// tree, regardless of which directory the engine is launched from.
 // -----------------------------------------------------------------------
-static const char* const DISCOVERY_CANDIDATES[] = {
-    "src/eval/fv.bin",
-    "eval/fv.bin",
-};
+#ifndef SHOGIAI_SOURCE_DIR
+#define SHOGIAI_SOURCE_DIR ""
+#endif
+
+// Directory containing the running executable, or "" if it cannot be
+// determined on this platform. Used to build cwd-independent discovery
+// candidates relative to where the binary actually lives (e.g. the CMake
+// build tree), which matters because most USI GUIs launch the engine with
+// an arbitrary working directory, not the build or repository directory.
+std::string get_executable_dir() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+#if defined(__linux__)
+    char buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    // readlink() silently truncates (no null terminator, and returns the
+    // full requested count) if the real path doesn't fit; treat that as
+    // "undeterminable" rather than risk a corrupted/truncated path.
+    if (len > 0 && len < static_cast<ssize_t>(sizeof(buf) - 1)) {
+        buf[len] = '\0';
+        fs::path p = fs::canonical(fs::path(buf), ec);
+        if (ec) p = fs::path(buf);
+        return p.parent_path().string();
+    }
+#elif defined(__APPLE__)
+    char buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0) {
+        fs::path p = fs::canonical(fs::path(buf), ec);
+        if (ec) p = fs::path(buf);
+        return p.parent_path().string();
+    }
+#elif defined(_WIN32)
+    char buf[MAX_PATH];
+    SetLastError(ERROR_SUCCESS);
+    DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    // GetModuleFileNameA() truncates silently on some Windows versions
+    // when the path doesn't fit, without len reaching MAX_PATH; checking
+    // GetLastError() for ERROR_INSUFFICIENT_BUFFER catches that case too.
+    if (len > 0 && len < MAX_PATH && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        fs::path p(buf);
+        return p.parent_path().string();
+    }
+#endif
+    return "";
+}
+
+// -----------------------------------------------------------------------
+// Automatic discovery candidates (tried in order when no explicit path is
+// set via setoption/set_eval_file_path/SHOGIAI_EVAL_FILE). Built fresh on
+// every call so it reflects the *current* working directory (tests change
+// cwd at runtime) while still preferring cwd-independent locations first.
+// -----------------------------------------------------------------------
+std::vector<std::string> build_discovery_candidates() {
+    std::vector<std::string> v;
+
+    // Priority A: compile-time repository path (works regardless of cwd
+    // or where the built binary was copied/launched from).
+    if (SHOGIAI_SOURCE_DIR[0] != '\0') {
+        v.push_back(std::string(SHOGIAI_SOURCE_DIR) + "/src/eval/fv.bin");
+    }
+
+    // Priority B: paths relative to the running executable's own
+    // directory (covers "cmake --build" trees where fv.bin was copied
+    // next to the binary, and users who copy the binary elsewhere but
+    // keep fv.bin alongside it).
+    const std::string exe_dir = get_executable_dir();
+    if (!exe_dir.empty()) {
+        v.push_back(exe_dir + "/eval/fv.bin");
+        v.push_back(exe_dir + "/src/eval/fv.bin");
+        v.push_back(exe_dir + "/../eval/fv.bin");
+        v.push_back(exe_dir + "/../src/eval/fv.bin");
+    }
+
+    // Priority C: paths relative to the current working directory, kept
+    // for backward compatibility with users who launch from the build
+    // directory or the repository root.
+    v.push_back("src/eval/fv.bin");
+    v.push_back("eval/fv.bin");
+
+    return v;
+}
 
 // -----------------------------------------------------------------------
 // Bonanza feature-space constants (see file header comment for provenance).
@@ -97,13 +198,23 @@ constexpr int64_t KK_BYTES  = KK_CNT  * static_cast<int64_t>(sizeof(int32_t));
 constexpr int64_t KP_BYTES  = KP_CNT  * static_cast<int64_t>(sizeof(int32_t));
 constexpr int64_t FV_BIN_BYTES = KPP_BYTES + KKP_BYTES + KK_BYTES + KP_BYTES; // 215,824,824
 
-// Built-in material values, used only for MATERIAL_FALLBACK (no valid
-// fv.bin present). The Bonanza table format has no separate material
-// table of its own (material is implicit in KP/KKP/KPP), so a small
-// hand-written fallback keeps the engine playable without any file.
+// Piece values used for the material term. Used as the *entire* score for
+// MATERIAL_FALLBACK (no valid fv.bin present), and as an additive term
+// summed alongside the KKP/KPP relation terms when a real fv.bin is loaded
+// (BONANZA_V6_FV) — matching genuine Bonanza, which always adds a
+// separately-computed material term rather than relying on it being
+// implicit in the relation tables (see file header comment for
+// provenance).
 constexpr std::array<int, PT_NB> FALLBACK_PIECE_VALUE{
     0, 100, 300, 300, 500, 600, 800, 1000, 0, 600, 600, 600, 600, 1100, 1300
 };
+
+// Bonanza's classic fixed-point scale: raw KPP/KKP table units are 32x a
+// centipawn, so the material term (in centipawns) must be multiplied by
+// FV_SCALE before being summed with them, and the grand total divided by
+// FV_SCALE at the very end. Confirmed via kobanium/aobazero
+// src/usi-engine/bona/shogi.h (`#define FV_SCALE 32`).
+constexpr int64_t FV_SCALE = 32;
 
 // -----------------------------------------------------------------------
 // Global state
@@ -146,12 +257,11 @@ inline int64_t triangular_index(int a, int b) {
     return static_cast<int64_t>(hi) * (hi + 1) / 2 + lo;
 }
 
-inline int kk_lookup(int my_king, int opp_king) {
-    return g_tables.kk[static_cast<int64_t>(my_king) * SQ_NB + opp_king];
-}
-inline int kp_lookup(int my_king, int fe) {
-    return g_tables.kp[static_cast<int64_t>(my_king) * fe_end + fe];
-}
+// Note: the KK and KP tables are intentionally loaded (to validate the
+// on-disk file's size/layout, since they are genuinely part of a real
+// fv.bin) but never looked up here — neither reference implementation
+// cited in the file header comment ever reads them when scoring a
+// position, so no kk_lookup()/kp_lookup() helpers are defined.
 inline int kkp_lookup(int my_king, int opp_king, int fe) {
     return g_tables.kkp[(static_cast<int64_t>(my_king) * SQ_NB + opp_king) * fe_end + fe];
 }
@@ -281,7 +391,10 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
     }
 
     g_tables = std::move(loaded);
-    g_status = "bonanza-v6 fv.bin loaded from " + path + " [" + tag + "]";
+    std::error_code ec;
+    const std::string abs_path = std::filesystem::absolute(std::filesystem::path(path), ec).string();
+    g_status = "bonanza-v6 fv.bin loaded from " + (ec ? path : abs_path) + " [" + tag
+             + "] [family=BONANZA_V6_FV]";
     g_family = EvalFamily::BONANZA_V6_FV;
     return true;
 }
@@ -305,8 +418,12 @@ void try_load_eval_file_once() {
         }
     }
 
-    // Priority 3: auto-discovery
-    for (const char* candidate : DISCOVERY_CANDIDATES) {
+    // Priority 3: auto-discovery. Candidates are recomputed on every call
+    // (see build_discovery_candidates()) so they reflect the executable's
+    // own location and the current working directory, in that priority
+    // order, rather than only ever checking two fixed cwd-relative paths.
+    const std::vector<std::string> candidates = build_discovery_candidates();
+    for (const std::string& candidate : candidates) {
         if (try_load_from_path(candidate, /*is_auto=*/true)) return;
         // Stop discovery early if we positively identified an unsupported
         // (NNUE-looking) file at this candidate path.
@@ -314,9 +431,13 @@ void try_load_eval_file_once() {
     }
 
     // Priority 4: built-in material fallback
+    std::string checked;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (i) checked += ", ";
+        checked += candidates[i];
+    }
     g_status = "material-only fallback"
-               " (no compatible fv.bin found;"
-               " auto-discovery checked: src/eval/fv.bin, eval/fv.bin)";
+               " (no compatible fv.bin found; auto-discovery checked: " + checked + ")";
     g_family = EvalFamily::MATERIAL_FALLBACK;
 }
 
@@ -350,37 +471,67 @@ int evaluate(const Board& board) {
 
     const Color us = board.side_to_move();
 
+    // Material term: the entire score for MATERIAL_FALLBACK, and an
+    // additive term (scaled by FV_SCALE) alongside the KKP/KPP relation
+    // terms for BONANZA_V6_FV. Computed once, from Black's point of view
+    // (positive == good for Black), matching the sign convention used by
+    // the rest of the Bonanza-formula computation below.
+    int material_black = 0;
+    for (int s = 0; s < SQUARE_NB; ++s) {
+        Piece p = board.piece_at(s);
+        if (p == NO_PIECE) continue;
+        int v = FALLBACK_PIECE_VALUE[type_of(p)];
+        material_black += (color_of(p) == BLACK) ? v : -v;
+    }
+    for (int pt = PAWN; pt <= ROOK; ++pt) {
+        int v = FALLBACK_PIECE_VALUE[pt];
+        material_black += board.hand(BLACK, static_cast<PieceType>(pt)) * v;
+        material_black -= board.hand(WHITE, static_cast<PieceType>(pt)) * v;
+    }
+
     if (g_family != EvalFamily::BONANZA_V6_FV) {
         // Material-only fallback (no valid fv.bin, or NNUE detected).
-        int score = 0;
-        for (int s = 0; s < SQUARE_NB; ++s) {
-            Piece p = board.piece_at(s);
-            if (p == NO_PIECE) continue;
-            int v = FALLBACK_PIECE_VALUE[type_of(p)];
-            score += (color_of(p) == us) ? v : -v;
-        }
-        for (int pt = PAWN; pt <= ROOK; ++pt) {
-            int v = FALLBACK_PIECE_VALUE[pt];
-            score += board.hand(us,  static_cast<PieceType>(pt)) * v;
-            score -= board.hand(~us, static_cast<PieceType>(pt)) * v;
-        }
-        return score;
+        return (us == BLACK) ? material_black : -material_black;
     }
 
-    // Bonanza-v6 three-piece-relation (KPP/KKP) evaluation, computed from
-    // the perspective of the side to move (`us`). See file header comment
-    // for the exact formula and its known simplifications.
-    const int my_king  = view_sq(board.king_sq(us),  us);
-    const int opp_king = view_sq(board.king_sq(~us), us);
-    const std::vector<int> features = build_feature_list(board, us);
+    // Bonanza-v6 KPP/KKP evaluation. Always accumulated from Black's point
+    // of view, then negated at the very end if White is to move — exactly
+    // like genuine Bonanza (see file header comment for the exact formula
+    // and its provenance from two independent reference implementations).
+    const int sq_bk     = to_bonanza_sq(board.king_sq(BLACK));
+    const int sq_wk     = to_bonanza_sq(board.king_sq(WHITE));
+    const int sq_wk_inv = mirror_sq(sq_wk);
 
-    int64_t score = kk_lookup(my_king, opp_king);
-    for (size_t i = 0; i < features.size(); ++i) {
-        score += kp_lookup(my_king, features[i]);
-        score += kkp_lookup(my_king, opp_king, features[i]);
-        for (size_t j = i + 1; j < features.size(); ++j) {
-            score += kpp_lookup(my_king, features[i], features[j]);
+    // list0: every non-king piece, expressed from Black's own point of
+    // view (own == Black uses f_*, squares unmirrored).
+    // list1: the same pieces, expressed from White's own point of view
+    // (own == White uses f_*, squares mirrored 180 degrees).
+    const std::vector<int> list0 = build_feature_list(board, BLACK);
+    const std::vector<int> list1 = build_feature_list(board, WHITE);
+
+    int64_t score = static_cast<int64_t>(material_black) * FV_SCALE;
+
+    // One KKP term per piece, using Black's own king/opponent-king squares
+    // (unmirrored) and Black's own feature index — never the White-view
+    // list, and never negated.
+    for (size_t i = 0; i < list0.size(); ++i) {
+        score += kkp_lookup(sq_bk, sq_wk, list0[i]);
+    }
+
+    // Two-piece KPP term, summed once from Black's own point of view and
+    // once from White's (mirrored) point of view, with the second pass
+    // SUBTRACTED rather than added.
+    for (size_t i = 0; i < list0.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            score += kpp_lookup(sq_bk, list0[i], list0[j]);
         }
     }
-    return static_cast<int>(score);
+    for (size_t i = 0; i < list1.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            score -= kpp_lookup(sq_wk_inv, list1[i], list1[j]);
+        }
+    }
+
+    if (us == WHITE) score = -score;
+    return static_cast<int>(score / FV_SCALE);
 }
