@@ -75,6 +75,33 @@ inline bool is_mate_score(int score) {
     return std::abs(score) >= MATE_SCORE_THRESHOLD;
 }
 
+// === Alpha-beta score clamping ===============================================
+// This engine is written in negamax form: every call to search()/quiescence()
+// evaluates a position purely from the perspective of the side to move at
+// that node, which is exactly the "max side" of classic (non-negated)
+// minimax terminology (each node always maximizes its own outcome). Per the
+// pruning/return requirement, once such a value falls to -1000 or below it
+// must be returned as exactly -1000.
+//
+// The "min side" of classic minimax never appears as a separate code path
+// here: it is realized implicitly whenever a caller negates a child's
+// return value (`-search(...)`), turning the child's own max-side result
+// into the caller's view of the opponent's (minimizing) response. Because
+// negation is linear, clamping the max-side floor at -1000 automatically
+// yields the mirrored min-side ceiling of +1000 once that value is negated
+// by the caller -- satisfying both stated requirements with a single,
+// symmetric clamp, without touching the sign convention anywhere.
+//
+// Mate scores are intentionally excluded: they encode forced-mate distance
+// rather than a static evaluation, and flattening them to +-1000 would
+// break checkmate detection/avoidance.
+constexpr int EVAL_CLAMP_FLOOR = -1000;
+
+inline int clamp_eval_score(int score) {
+    if (is_mate_score(score)) return score;
+    return (score <= EVAL_CLAMP_FLOOR) ? EVAL_CLAMP_FLOOR : score;
+}
+
 inline int tt_store_score(int score, int ply) {
     if (score >= MATE_SCORE_THRESHOLD) return score + ply;
     if (score <= -MATE_SCORE_THRESHOLD) return score - ply;
@@ -261,12 +288,12 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
         hash_move = entry->best_move;
         if (entry->depth >= depth) {
             const int tt_score = tt_probe_score(entry->score, ply);
-            if (entry->bound == BOUND_EXACT) return tt_score;
+            if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
             if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
             else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
             if (alpha >= beta) {
                 ++g_tt_cutoffs;
-                return tt_score;
+                return clamp_eval_score(tt_score);
             }
         }
     }
@@ -278,7 +305,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
         const int rfp_margin = 200 * depth;
         const int static_eval = evaluate(board);
         if (static_eval - rfp_margin >= beta)
-            return static_eval;
+            return clamp_eval_score(static_eval);
     }
 
     // === Null Move Pruning ===
@@ -325,7 +352,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             if (null_score >= beta && !is_mate_score(null_score)) {
                 ++g_threshold_cutoffs;
                 tt_store(board.hash(), depth, null_score, BOUND_LOWER, MOVE_NONE, ply);
-                return null_score;
+                return clamp_eval_score(null_score);
             }
         }
     }
@@ -428,13 +455,14 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
         }
     }
 
-    if (g_stop.load(std::memory_order_relaxed)) return (best_move == MOVE_NONE) ? 0 : best_score;
+    if (g_stop.load(std::memory_order_relaxed))
+        return (best_move == MOVE_NONE) ? 0 : clamp_eval_score(best_score);
 
     BoundType bound = BOUND_EXACT;
     if (best_score <= original_alpha) bound = BOUND_UPPER;
     else if (best_score >= original_beta) bound = BOUND_LOWER;
     tt_store(board.hash(), depth, best_score, bound, best_move, ply);
-    return best_score;
+    return clamp_eval_score(best_score);
 }
 
 int quiescence(Board& board, int alpha, int beta, int ply) {
@@ -458,12 +486,12 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
         hash_move = entry->best_move;
         if (entry->depth >= 0) {
             const int tt_score = tt_probe_score(entry->score, ply);
-            if (entry->bound == BOUND_EXACT) return tt_score;
+            if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
             if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
             else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
             if (alpha >= beta) {
                 ++g_tt_cutoffs;
-                return tt_score;
+                return clamp_eval_score(tt_score);
             }
         }
     }
@@ -472,17 +500,17 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
     if (!in_check) {
         if (stand_pat >= beta) {
             tt_store(board.hash(), 0, stand_pat, BOUND_LOWER, MOVE_NONE, ply);
-            return stand_pat;
+            return clamp_eval_score(stand_pat);
         }
         alpha = std::max(alpha, stand_pat);
     }
 
     MoveList legal_moves;
     generate_legal_moves(board, legal_moves);
-    if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : stand_pat;
+    if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
 
     auto ordered = order_moves(board, legal_moves, ply, hash_move, !in_check);
-    if (ordered.empty()) return stand_pat;
+    if (ordered.empty()) return clamp_eval_score(stand_pat);
 
     int best_score = in_check ? -INF : stand_pat;
     Move best_move = MOVE_NONE;
@@ -516,13 +544,14 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
         }
     }
 
-    if (g_stop.load(std::memory_order_relaxed)) return (best_move == MOVE_NONE) ? stand_pat : best_score;
+    if (g_stop.load(std::memory_order_relaxed))
+        return (best_move == MOVE_NONE) ? clamp_eval_score(stand_pat) : clamp_eval_score(best_score);
 
     BoundType bound = BOUND_EXACT;
     if (best_score <= original_alpha) bound = BOUND_UPPER;
     else if (best_score >= original_beta) bound = BOUND_LOWER;
     tt_store(board.hash(), 0, best_score, bound, best_move, ply);
-    return best_score;
+    return clamp_eval_score(best_score);
 }
 
 } // namespace

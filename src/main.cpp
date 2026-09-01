@@ -32,7 +32,7 @@ int main() {
         if (cmd == "usi") {
             std::cout << "id name ShogiEngine\n";
             std::cout << "id author ShogiAI\n";
-            std::cout << "option name EvalFile type string default eval/kpp_weights.txt\n";
+            std::cout << "option name EvalFile type string default eval/fv.bin\n";
             std::cout << "usiok\n";
             std::cout.flush();
 
