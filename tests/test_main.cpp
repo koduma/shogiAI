@@ -569,8 +569,39 @@ static void test_lmr_preserves_tactical_best_move() {
 }
 
 // ============================================================
-// Eval file: helper to write a temporary file
+// Test: alpha-beta clamps the returned score to -1000 once a node's
+// evaluated value drops to -1000 or below.
+//
+// Position: the side to move has only its king on the board; the
+// opponent holds rook+bishop+gold+silver in hand (material fallback
+// values 1000+800+600+500 = 2900), so the true material evaluation for
+// the mover is far below -1000 in every reachable line (no captures are
+// available to recover any of it). Per the requirement, the "max side"
+// (every negamax node, from its own mover's perspective) must clamp such
+// a value to exactly -1000 before returning.
 // ============================================================
+static void test_alpha_beta_clamps_large_deficit_to_minus_1000() {
+    Board b;
+    b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b rbgs 1");
+    const int score = negamax(b, 1, -INF, INF, 0);
+    CHECK_EQ(score, -1000);
+}
+
+// ============================================================
+// Test: the same clamp applies regardless of which side is to move
+// (guards against the clamp being wired to the wrong side).
+// ============================================================
+static void test_alpha_beta_clamp_side_agnostic() {
+    Board b;
+    b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 w RBGS 1");
+    const int score = negamax(b, 1, -INF, INF, 0);
+    CHECK_EQ(score, -1000);
+}
+
+// ============================================================
+// Eval file: helpers to write temporary fv.bin-shaped files
+// ============================================================
+#include <cstdio>
 #include <fstream>
 
 static void write_tmp_file(const std::string& path, const std::string& contents) {
@@ -578,25 +609,40 @@ static void write_tmp_file(const std::string& path, const std::string& contents)
     f << contents;
 }
 
-// ============================================================
-// Test: explicit KPP eval file is loaded and status reflects it
-// ============================================================
-static void test_eval_explicit_kpp_file_loaded() {
-    const std::string tmp = "/tmp/shogiai_test_kpp_explicit.txt";
-    write_tmp_file(tmp,
-        "model_type=kpp\n"
-        "kpp_weight=12\n"
-        "piece_pawn=100\n");
+// Creates a file of exactly `bytes` length, filled with zero bytes, using a
+// sparse-file truncate so tests don't need to actually write ~206 MiB of
+// data to disk. This models a syntactically-valid (all-zero-weight) fv.bin.
+static void write_zero_filled_file(const std::string& path, int64_t bytes) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+#if defined(_WIN32)
+    std::fseek(f, static_cast<long>(bytes - 1), SEEK_SET);
+    std::fputc('\0', f);
+#else
+    if (bytes > 0) {
+        std::fseek(f, static_cast<long>(bytes - 1), SEEK_SET);
+        std::fputc('\0', f);
+    }
+#endif
+    std::fclose(f);
+}
 
-    set_eval_file_path(tmp);
+// The exact expected fv.bin size for the Bonanza v6 KPP+KKP+KK+KP layout
+// implemented in eval.cpp (kept in sync manually; see eval.cpp for the
+// derivation of this constant from Bonanza's fe_end == 1476).
+constexpr int64_t EXPECTED_FV_BIN_BYTES = 215'824'824;
+
+// ============================================================
+// Test: missing fv.bin reports material-only fallback
+// ============================================================
+static void test_eval_fv_bin_file_not_found() {
+    set_eval_file_path("/tmp/shogiai_nonexistent_fv_99999.bin");
     const std::string status = eval_status_message();
 
-    CHECK(status.find("kpp: loaded") != std::string::npos);
-    CHECK(status.find("explicit") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::KPP);
+    CHECK(status.find("file not found") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
 
-    // Symmetry preserved after loading
+    // Engine must still work (material-only fallback), symmetric position → 0
     Board b;
     b.set_startpos();
     CHECK_EQ(evaluate(b), 0);
@@ -605,45 +651,66 @@ static void test_eval_explicit_kpp_file_loaded() {
 }
 
 // ============================================================
-// Test: explicit path overrides auto-discovery
+// Test: wrong-sized fv.bin (e.g. the 1-byte placeholder dummy shipped in
+// the repository) is rejected with a clear, actionable status message.
 // ============================================================
-static void test_eval_explicit_overrides_auto() {
-    const std::string tmp = "/tmp/shogiai_test_explicit_override.txt";
-    // Use a different kpp_weight to confirm this file is actually loaded
-    write_tmp_file(tmp,
-        "model_type=kpp\n"
-        "kpp_weight=20\n"
-        "piece_pawn=100\n"
-        "piece_lance=300\n"
-        "piece_knight=300\n"
-        "piece_silver=500\n"
-        "piece_gold=600\n"
-        "piece_bishop=800\n"
-        "piece_rook=1000\n"
-        "piece_prom_pawn=600\n"
-        "piece_prom_lance=600\n"
-        "piece_prom_knight=600\n"
-        "piece_prom_silver=600\n"
-        "piece_prom_bishop=1100\n"
-        "piece_prom_rook=1300\n");
+static void test_eval_fv_bin_size_mismatch_reports_clear_error() {
+    const std::string tmp = "/tmp/shogiai_test_fv_wrong_size.bin";
+    write_tmp_file(tmp, "x"); // 1 byte, mimics the checked-in dummy fv.bin
 
     set_eval_file_path(tmp);
     const std::string status = eval_status_message();
-    CHECK(status.find("explicit") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    // The auto-discovery candidates are NOT mentioned in the status
-    CHECK(status.find("auto-discovery") == std::string::npos);
+
+    CHECK(status.find("invalid Bonanza v6 fv.bin size") != std::string::npos);
+    CHECK(status.find("got 1 bytes") != std::string::npos);
+    CHECK(status.find(std::to_string(EXPECTED_FV_BIN_BYTES)) != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
 
     set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
 }
 
 // ============================================================
-// Test: NNUE model_type file is recognized as unsupported,
-//       engine stays functional with KPP fallback
+// Test: an exactly-sized (all-zero-weight) fv.bin loads successfully and
+// is reported as EvalFamily::BONANZA_V6_FV. With every table entry zero,
+// evaluate() must be exactly 0 for any position (deterministic, since the
+// implemented formula is a pure sum of table lookups with no separate
+// material term once a real fv.bin is active).
+// ============================================================
+static void test_eval_fv_bin_correct_size_loads_and_evaluates() {
+    const std::string tmp = "/tmp/shogiai_test_fv_correct_size.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("bonanza-v6 fv.bin loaded from") != std::string::npos);
+    CHECK(status.find(tmp) != std::string::npos);
+    CHECK(status.find("[explicit]") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
+
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
+
+    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
+    CHECK_EQ(evaluate(b), 0); // all-zero tables → always 0, regardless of material
+
+    set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
+}
+
+// ============================================================
+// Test: NNUE-looking file path is recognized as unsupported,
+// engine stays functional with material fallback
 // ============================================================
 static void test_eval_nnue_unsupported_fallback() {
-    const std::string tmp = "/tmp/shogiai_test_nnue.txt";
-    write_tmp_file(tmp, "model_type=nnue\n");
+    const std::string tmp = "/tmp/shogiai_test_nnue.bin";
+    write_tmp_file(tmp, "not a real nnue file");
 
     set_eval_file_path(tmp);
     const std::string status = eval_status_message();
@@ -655,95 +722,27 @@ static void test_eval_nnue_unsupported_fallback() {
     // Engine must still return a sensible (non-crash) evaluation
     Board b;
     b.set_startpos();
-    CHECK_EQ(evaluate(b), 0); // symmetric position → 0 regardless of params
+    CHECK_EQ(evaluate(b), 0); // symmetric position → 0 regardless of family
 
     set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
 }
 
 // ============================================================
-// Test: file-not-found status and EvalFamily FALLBACK
-// ============================================================
-static void test_eval_file_not_found() {
-    set_eval_file_path("/tmp/shogiai_nonexistent_file_99999.txt");
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("file not found") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::FALLBACK);
-
-    // Engine must still work
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: parse-error status (file exists but has no valid keys)
-// ============================================================
-static void test_eval_parse_error_status() {
-    const std::string tmp = "/tmp/shogiai_test_comments_only.txt";
-    write_tmp_file(tmp, "# only a comment\n# another comment\n");
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("parse error") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::FALLBACK);
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: loading a KPP file with a modified piece_pawn value
-//       actually changes the evaluation result
-// ============================================================
-static void test_eval_custom_piece_value_applied() {
-    const std::string tmp = "/tmp/shogiai_test_pawn200.txt";
-    write_tmp_file(tmp,
-        "model_type=kpp\n"
-        "piece_pawn=200\n"   // doubled pawn value
-        "piece_lance=300\n"
-        "piece_knight=300\n"
-        "piece_silver=500\n"
-        "piece_gold=600\n"
-        "piece_bishop=800\n"
-        "piece_rook=1000\n"
-        "piece_prom_pawn=600\n"
-        "piece_prom_lance=600\n"
-        "piece_prom_knight=600\n"
-        "piece_prom_silver=600\n"
-        "piece_prom_bishop=1100\n"
-        "piece_prom_rook=1300\n");
-
-    set_eval_file_path(tmp);
-
-    // 1 black pawn in hand → score should reflect the 200-cp pawn value
-    Board b;
-    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
-    const int score = evaluate(b);
-    CHECK(score >= 200); // must be at least one 200-cp pawn advantage
-
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: auto-discovery finds eval/kpp_weights.txt in build dir
-//       (CMake copies src/eval/ → build/eval/ at configure time)
+// Test: auto-discovery finds eval/fv.bin in the build dir (CMake copies
+// src/eval/ → build/eval/ at configure time). The checked-in fv.bin is a
+// 1-byte dummy, so this must resolve to MATERIAL_FALLBACK with a size
+// mismatch message, never a crash and never a false "loaded" claim.
 // ============================================================
 static void test_eval_auto_discovery() {
     // Reset to auto-discovery mode (no explicit path).
     set_eval_file_path("");
     const std::string status = eval_status_message();
 
-    // Two acceptable outcomes:
-    //   (a) auto-discovered the build-dir copy: "kpp: loaded from ... [auto-discovered]"
-    //   (b) no file found: "kpp: built-in fallback ..."
-    // Both must NOT claim "unsupported evaluator" and must NOT crash.
     CHECK(status.find("unsupported evaluator") == std::string::npos);
 
     const EvalFamily fam = get_eval_family();
-    CHECK(fam == EvalFamily::KPP || fam == EvalFamily::FALLBACK);
+    CHECK(fam == EvalFamily::BONANZA_V6_FV || fam == EvalFamily::MATERIAL_FALLBACK);
 
     // Evaluation must remain valid and symmetric
     Board b;
@@ -751,37 +750,6 @@ static void test_eval_auto_discovery() {
     CHECK_EQ(evaluate(b), 0);
 
     set_eval_file_path(""); // ensure reset for subsequent tests
-}
-
-// ============================================================
-// Test: three-piece-relation alias accepted as KPP
-// ============================================================
-static void test_eval_three_piece_relation_alias() {
-    const std::string tmp = "/tmp/shogiai_test_tpr.txt";
-    write_tmp_file(tmp,
-        "model_type=three-piece-relation\n"
-        "kpp_weight=12\n"
-        "piece_pawn=100\n"
-        "piece_lance=300\n"
-        "piece_knight=300\n"
-        "piece_silver=500\n"
-        "piece_gold=600\n"
-        "piece_bishop=800\n"
-        "piece_rook=1000\n"
-        "piece_prom_pawn=600\n"
-        "piece_prom_lance=600\n"
-        "piece_prom_knight=600\n"
-        "piece_prom_silver=600\n"
-        "piece_prom_bishop=1100\n"
-        "piece_prom_rook=1300\n");
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("kpp: loaded") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::KPP);
-
-    set_eval_file_path(""); // reset
 }
 
 
@@ -816,16 +784,15 @@ int main() {
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();
     test_lmr_preserves_tactical_best_move();
+    test_alpha_beta_clamps_large_deficit_to_minus_1000();
+    test_alpha_beta_clamp_side_agnostic();
 
     // Eval file discovery and loading tests
-    test_eval_explicit_kpp_file_loaded();
-    test_eval_explicit_overrides_auto();
+    test_eval_fv_bin_file_not_found();
+    test_eval_fv_bin_size_mismatch_reports_clear_error();
+    test_eval_fv_bin_correct_size_loads_and_evaluates();
     test_eval_nnue_unsupported_fallback();
-    test_eval_file_not_found();
-    test_eval_parse_error_status();
-    test_eval_custom_piece_value_applied();
     test_eval_auto_discovery();
-    test_eval_three_piece_relation_alias();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "
