@@ -288,7 +288,7 @@ constexpr int64_t LEGACY_APERY_LAYOUT_BYTES = 215824824;
 // implicit in the relation tables (see file header comment for
 // provenance).
 constexpr std::array<int, PT_NB> FALLBACK_PIECE_VALUE{
-    0, 100, 300, 300, 500, 600, 800, 1000, 0, 600, 600, 600, 600, 1100, 1300
+0, 87, 232, 257, 369, 444, 569, 642, 0, 534, 489, 510, 495, 827, 945    
 };
 
 // Bonanza's classic fixed-point scale: raw KPP/KKP table units are 32x a
