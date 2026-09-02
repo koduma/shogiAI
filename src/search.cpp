@@ -95,7 +95,7 @@ inline bool is_mate_score(int score) {
 // Mate scores are intentionally excluded: they encode forced-mate distance
 // rather than a static evaluation, and flattening them to +-1000 would
 // break checkmate detection/avoidance.
-constexpr int EVAL_CLAMP_FLOOR = -1000;
+constexpr int EVAL_CLAMP_FLOOR = -1000000;
 
 inline int clamp_eval_score(int score) {
     if (is_mate_score(score)) return score;
