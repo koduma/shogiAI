@@ -629,14 +629,21 @@ static void write_zero_filled_file(const std::string& path, int64_t bytes) {
     std::fclose(f);
 }
 
-// The exact expected fv.bin size for the Bonanza v6 KPP+KKP+KK+KP layout
-// implemented in eval.cpp (kept in sync manually; see eval.cpp for the
-// derivation of this constant from Bonanza's fe_end == 1476).
-constexpr int64_t EXPECTED_FV_BIN_BYTES = 215'824'824;
+// The exact expected fv.bin size for the genuine Bonanza v6 KPP+KKP
+// layout implemented in eval.cpp (kept in sync manually; see eval.cpp's
+// file header comment for the derivation of this constant from genuine
+// Bonanza source: fe_end == 1476 for KPP, kkp_end == 738 for KKP).
+constexpr int64_t EXPECTED_FV_BIN_BYTES = 186'268'248;
+
+// A file of this size is recognized as a *specific, known* unsupported
+// layout (the previous, incorrect assumption this loader used to make,
+// based on a converter tool's expanded in-memory struct sizes) rather
+// than a generic wrong-sized file; see eval.cpp's LEGACY_APERY_LAYOUT_BYTES.
+constexpr int64_t LEGACY_APERY_LAYOUT_BYTES = 215'824'824;
 
 // ------------------------------------------------------------------
 // Mirrors of the region layout/sizes in eval.cpp (kept in sync manually;
-// see eval.cpp for the derivation from Bonanza's fe_end == 1476), used
+// see eval.cpp for the derivation from genuine Bonanza source), used
 // below to patch specific non-zero table entries into an otherwise
 // all-zero synthetic fv.bin so tests can assert on the *exact* numeric
 // result of evaluate() actually referencing loaded table data, rather
@@ -644,14 +651,12 @@ constexpr int64_t EXPECTED_FV_BIN_BYTES = 215'824'824;
 // ------------------------------------------------------------------
 constexpr int64_t FE_END       = 1476;
 constexpr int64_t POS_N        = FE_END * (FE_END + 1) / 2;
+constexpr int64_t KKP_END      = 738; // kkp_end: halved feature space for KKP
 constexpr int64_t SQ_NB        = 81;
-constexpr int64_t KPP_BYTES    = SQ_NB * POS_N * 2;                 // int16_t
-constexpr int64_t KKP_BYTES    = SQ_NB * SQ_NB * FE_END * 4;        // int32_t
-constexpr int64_t KK_BYTES     = SQ_NB * SQ_NB * 4;                 // int32_t
+constexpr int64_t KPP_BYTES    = SQ_NB * POS_N * 2;              // int16_t
+constexpr int64_t KKP_BYTES    = SQ_NB * SQ_NB * KKP_END * 2;    // int16_t
 constexpr int64_t KPP_OFFSET   = 0;
 constexpr int64_t KKP_OFFSET   = KPP_BYTES;
-constexpr int64_t KK_OFFSET    = KPP_BYTES + KKP_BYTES;
-constexpr int64_t KP_OFFSET    = KPP_BYTES + KKP_BYTES + KK_BYTES;
 
 static int64_t kpp_triangular_index(int a, int b) {
     const int hi = std::max(a, b);
@@ -662,18 +667,13 @@ static int64_t kpp_triangular_index(int a, int b) {
 static int64_t kpp_byte_offset(int king, int fa, int fb) {
     return KPP_OFFSET + (static_cast<int64_t>(king) * POS_N + kpp_triangular_index(fa, fb)) * 2;
 }
-static int64_t kkp_byte_offset(int king, int opp_king, int fe) {
-    return KKP_OFFSET + ((static_cast<int64_t>(king) * SQ_NB + opp_king) * FE_END + fe) * 4;
+// `kkp_idx` must already be a kkp-space index (kkp_hand_<piece> + count,
+// or kkp_<piece> + board square), not a full fe_end feature id.
+static int64_t kkp_byte_offset(int king, int opp_king, int kkp_idx) {
+    return KKP_OFFSET + ((static_cast<int64_t>(king) * SQ_NB + opp_king) * KKP_END + kkp_idx) * 2;
 }
 
 static void patch_int16(const std::string& path, int64_t offset, int16_t value) {
-    FILE* f = std::fopen(path.c_str(), "r+b");
-    if (!f) return;
-    std::fseek(f, static_cast<long>(offset), SEEK_SET);
-    std::fwrite(&value, sizeof(value), 1, f);
-    std::fclose(f);
-}
-static void patch_int32(const std::string& path, int64_t offset, int32_t value) {
     FILE* f = std::fopen(path.c_str(), "r+b");
     if (!f) return;
     std::fseek(f, static_cast<long>(offset), SEEK_SET);
@@ -776,11 +776,12 @@ static void test_eval_fv_bin_real_kkp_value_is_used() {
     const std::string tmp = "/tmp/shogiai_test_fv_kkp_nonzero.bin";
     write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
 
-    // f_pawn == 81 (see eval.cpp); feature index for the black pawn as
-    // seen from Black's own point of view is f_pawn + bonanza_sq(40) = 121.
-    constexpr int kSqBk = 0, kSqWk = 80, kFeature = 81 + 40;
-    constexpr int32_t kKkpValue = 6400; // 200 centipawns * FV_SCALE(32)
-    patch_int32(tmp, kkp_byte_offset(kSqBk, kSqWk, kFeature), kKkpValue);
+    // kkp_pawn == 36 (see eval.cpp); the kkp-space index for the black
+    // pawn (looked up unmirrored, at the (SQ_BKING, SQ_WKING) pair) is
+    // kkp_pawn + bonanza_sq(40) = 76.
+    constexpr int kSqBk = 0, kSqWk = 80, kKkpIdx = 36 + 40;
+    constexpr int16_t kKkpValue = 6400; // 200 centipawns * FV_SCALE(32)
+    patch_int16(tmp, kkp_byte_offset(kSqBk, kSqWk, kKkpIdx), kKkpValue);
 
     set_eval_file_path(tmp);
     CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
@@ -792,6 +793,45 @@ static void test_eval_fv_bin_real_kkp_value_is_used() {
 
     // Same physical position, White to move: sign flips exactly.
     b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k w - 1");
+    CHECK_EQ(evaluate(b), -300);
+
+    set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
+}
+
+// ============================================================
+// Test: a hand-crafted fv.bin with a known non-zero KKP table entry for
+// a *White* piece produces the exact expected (subtracted, mirrored)
+// evaluate() result. This is the regression guarding against the KKP
+// term only ever being applied with the correct sign/king-pair/mirrored
+// square for the opponent's own pieces, not just Black's.
+//
+// Position: "K8/9/9/9/4p4/9/9/9/8k b - 1"
+//   Black king  @ square 0  (Bonanza sq 0)
+//   White king  @ square 80 (Bonanza sq 80)
+//   White pawn  @ square 40 (Bonanza sq 40, mirror(40) == 40)
+// ============================================================
+static void test_eval_fv_bin_real_kkp_white_piece_is_subtracted_and_mirrored() {
+    const std::string tmp = "/tmp/shogiai_test_fv_kkp_white_nonzero.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
+
+    // White's own pieces are looked up at (Inv(SQ_WKING), Inv(SQ_BKING))
+    // = (Inv(80), Inv(0)) = (0, 80), using the MIRRORED board square:
+    // kkp_pawn + mirror(40) = 36 + 40 = 76 (square 40 mirrors to itself
+    // on the 9x9 board, so this deliberately keeps the same index as the
+    // Black test above to prove the SIGN/king-pair wiring, not just the
+    // square-mirroring arithmetic).
+    constexpr int kSqBk1 = 0, kSqWk1 = 80, kKkpIdx = 36 + 40;
+    constexpr int16_t kKkpValue = 6400; // 200 centipawns * FV_SCALE(32)
+    patch_int16(tmp, kkp_byte_offset(kSqBk1, kSqWk1, kKkpIdx), kKkpValue);
+
+    set_eval_file_path(tmp);
+    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
+
+    Board b;
+    b.parse_sfen("K8/9/9/9/4p4/9/9/9/8k b - 1");
+    // material (-100cp, one White pawn) * 32 - kkp(6400), all / 32
+    // == -100 - 200 == -300
     CHECK_EQ(evaluate(b), -300);
 
     set_eval_file_path(""); // reset
@@ -852,6 +892,31 @@ static void test_eval_fv_bin_one_byte_short_is_rejected() {
 
     CHECK(status.find("invalid Bonanza v6 fv.bin size") != std::string::npos);
     CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+
+    set_eval_file_path(""); // reset
+    std::remove(tmp.c_str());
+}
+
+// ============================================================
+// Test: a file matching the previous (incorrect) 215,824,824-byte
+// assumption is recognized and reported as a specific, known unsupported
+// layout — not silently accepted as if it were the real 186,268,248-byte
+// format, and not just a generic "invalid size" message either.
+// ============================================================
+static void test_eval_fv_bin_legacy_size_reports_specific_error() {
+    const std::string tmp = "/tmp/shogiai_test_fv_legacy_size.bin";
+    write_zero_filled_file(tmp, LEGACY_APERY_LAYOUT_BYTES);
+
+    set_eval_file_path(tmp);
+    const std::string status = eval_status_message();
+
+    CHECK(status.find("unsupported fv.bin layout") != std::string::npos);
+    CHECK(status.find(std::to_string(LEGACY_APERY_LAYOUT_BYTES)) != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), 0);
 
     set_eval_file_path(""); // reset
     std::remove(tmp.c_str());
@@ -993,8 +1058,10 @@ int main() {
     test_eval_fv_bin_size_mismatch_reports_clear_error();
     test_eval_fv_bin_correct_size_loads_and_evaluates();
     test_eval_fv_bin_real_kkp_value_is_used();
+    test_eval_fv_bin_real_kkp_white_piece_is_subtracted_and_mirrored();
     test_eval_fv_bin_real_kpp_pair_value_is_used();
     test_eval_fv_bin_one_byte_short_is_rejected();
+    test_eval_fv_bin_legacy_size_reports_specific_error();
     test_eval_nnue_unsupported_fallback();
     test_eval_auto_discovery();
     test_eval_auto_discovery_independent_of_cwd();

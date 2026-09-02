@@ -29,61 +29,74 @@
 // Bonanza 6.0 "fv.bin" three-piece-relation (KPP/KKP) evaluator
 // ============================================================
 // This file implements the classic Bonanza-style evaluation table format:
-// King+Piece+Piece (KPP), King+King+Piece (KKP), King+King (KK) and
-// King+Piece (KP) relation tables, loaded verbatim from an unmodified
-// Bonanza 6.0 fv.bin (as distributed in bonanza_v6.0.zip).
+// King+Piece+Piece (KPP) and King+King+Piece (KKP) relation tables,
+// loaded verbatim from an unmodified Bonanza 6.0 fv.bin.
 //
-// Feature space & byte layout are NOT invented for this task: they are
-// taken from the publicly available Bonanza→Apery table converter
-// (HiraokaTakuya/apery, utils/bonanzatoapery/main.cpp), which reads a
-// genuine Bonanza 6 fv.bin with exactly this structure and these
-// constants (`Bonanza::fe_end == 1476`, `Bonanza::pos_n == fe_end*(fe_end+1)/2`,
-// KPPType == int16_t, KKPType/KKType/KPType == int32_t). We reproduce that
-// structure here so the *actual* fv.bin bytes the user places on disk are
-// interpreted the same way the reference implementation does.
+// IMPORTANT (root-cause of a real user-reported bug): an earlier version
+// of this file assumed a 215,824,824-byte layout (KPP int16_t + KKP/KK/KP
+// as int32_t, KKP indexed by the full `fe_end`), based on a *converter*
+// tool's in-memory representation (HiraokaTakuya/apery,
+// utils/bonanzatoapery/main.cpp). That converter's *output* struct sizes
+// are not the same thing as genuine Bonanza's own on-disk fv.bin format,
+// and real user fv.bin files (186,268,248 bytes) were rejected as
+// "invalid size", silently degrading every game to material-only scoring
+// (evaluate() always returning the same material-only value, i.e. "always
+// 0" for symmetric positions).
 //
-// fv.bin byte layout (read in this exact order):
-//   1. KPP : int16_t[SQUARE_NB][pos_n]                      (~168.4 MiB)
-//   2. KKP : int32_t[SQUARE_NB][SQUARE_NB][fe_end]           (~36.9 MiB)
-//   3. KK  : int32_t[SQUARE_NB][SQUARE_NB]                   (~25.6 KiB)
-//   4. KP  : int32_t[SQUARE_NB][fe_end]                      (~466.9 KiB)
-//   Total: 215,824,824 bytes (~205.8 MiB). The KPP table alone accounts
-//   for ~168 MiB, which is why a real fv.bin "feels" like the commonly
-//   quoted "about 170MB" file size even though the full file is larger.
+// The genuine, verbatim Bonanza 6.0 engine source (mirrored e.g. at
+// puriketu99/bonanza and endlfu/bonanza, src/client/ini.c `load_fv()` and
+// src/client/shogi.h) reads fv.bin as *exactly two* tables, both
+// `short` (int16_t), in this order:
+//   1. KPP : int16_t[SQUARE_NB][pos_n]                        (176,584,212 bytes)
+//            pos_n = fe_end*(fe_end+1)/2, fe_end == 1476 (triangular,
+//            unordered-pair index over the full feature space).
+//   2. KKP : int16_t[SQUARE_NB][SQUARE_NB][kkp_end]             (9,684,036 bytes)
+//            kkp_end == 738 (== fe_end/2): KKP does NOT use the full
+//            fe_end feature space. Because a KKP entry is always looked
+//            up with a specific (my-king, opp-king) pair that already
+//            encodes "whose piece this is" (own pieces use the
+//            unmirrored (SQ_BKING, SQ_WKING) pair; opponent pieces use
+//            the mirrored (Inv(SQ_WKING), Inv(SQ_BKING)) pair, with the
+//            resulting term SUBTRACTED), there is no need for separate
+//            own/enemy feature ids the way KPP has them — halving the
+//            feature space to `kkp_end`.
+//   Total: 186,268,248 bytes. There is NO separate on-disk KK or KP
+//   table — genuine Bonanza's `load_fv()` never reads them (`ini.c`
+//   contains exactly the two `fread()` calls above and nothing else).
 //
-// Because this sandbox does not have access to a real Bonanza 6.0 fv.bin,
-// the exact numeric weights obviously cannot be exercised or validated
-// here. What *is* validated is: (a) the file-size / structural checks
-// below, using synthetically-sized files, and (b) that a hand-crafted,
-// correctly-sized fv.bin with known non-zero table entries at known
-// offsets produces exactly the expected numeric evaluate() result (see
-// tests/test_main.cpp). Users who place their genuine fv.bin should
-// sanity-check `eval_status_message()` after startup; a size mismatch is
-// reported explicitly rather than silently mis-parsed.
+// This is independently confirmed against the *actual byte size* the
+// user's real fv.bin reported: 186,268,248 == 81*1,090,026*2 (KPP) +
+// 81*81*738*2 (KKP), an exact match with no slack.
+//
+// A file whose size happens to match the previous, incorrect
+// 215,824,824-byte assumption is still recognized specially and reported
+// with its own explicit message (rather than a generic size mismatch),
+// per the requirement that unsupported/ambiguous formats must be
+// reported clearly instead of guessed at.
 //
 // The scoring formula implemented in evaluate() below is the classic
-// Bonanza formula, NOT a re-derived approximation: it is taken directly
-// from two independent, publicly available reference implementations
-// that both agree on it exactly:
-//   - kobanium/aobazero, src/usi-engine/bona/evaluate.cpp (a near-verbatim
-//     port of the original Bonanza C source: functions evaluate()/
-//     make_list()/doapc()/doacapt()).
-//   - HiraokaTakuya/apery, src/evaluate.cpp (evaluateUnUseDiff()).
-// Both sources independently confirm: FV_SCALE == 32; the score is always
-// accumulated from BLACK's point of view and negated at the very end if
-// White is to move; only ONE KKP term is added per non-king piece (using
-// Black's own king/opponent-king squares, unmirrored, and Black's own
-// feature index); the two-piece KPP term is summed TWICE — once from
-// Black's own point of view (own king square, Black's feature list) and
-// once from White's point of view (Black-mirrored White king square,
-// White's feature list) — and the second sum is SUBTRACTED, not added;
-// and a separate material term (see FALLBACK_PIECE_VALUE below) is added
-// on top, scaled by FV_SCALE, exactly like the rest of the summation.
-// Neither reference implementation's actual evaluate() ever reads the KK
-// or KP tables at all (they exist in the raw fv.bin/converted-file layout
-// purely for structural/converter compatibility with other consumers), so
-// this implementation loads them (to validate file size/layout) but does
-// not use them when scoring, matching both reference implementations.
+// Bonanza formula, transcribed directly from genuine Bonanza source
+// (src/client/evaluate.c: `evaluate()` / `make_list()`), not a
+// re-derived approximation:
+//   - FV_SCALE == 32 (src/client/shogi.h: `#define FV_SCALE 32`).
+//   - The score is always accumulated from BLACK's point of view and
+//     negated at the very end if White is to move.
+//   - KKP: exactly ONE term per non-king piece (hand or board), added
+//     for Black's own pieces (looked up at kkp[SQ_BKING][SQ_WKING][idx],
+//     idx = kkp_<piece>_offset + own-hand-count or absolute board
+//     square) and SUBTRACTED for White's own pieces (looked up at
+//     kkp[Inv(SQ_WKING)][Inv(SQ_BKING)][idx], idx using the *mirrored*
+//     board square for board pieces). Promoted minor pieces (と/成香/
+//     成桂/成銀) share GOLD's slot; promoted bishop/rook use HORSE/DRAGON.
+//   - KPP: the two-piece term is summed over EVERY unordered pair
+//     (i, j) with i >= j *including the diagonal i == j* (see
+//     `evaluate()`'s `for (j = 0; j <= i; j++)`, not `j < i`) — once from
+//     Black's own point of view (own king square, Black's feature list)
+//     and once from White's point of view (Black-mirrored White king
+//     square, White's feature list), with the second sum SUBTRACTED.
+//   - A separate material term (see FALLBACK_PIECE_VALUE below) is added
+//     on top, scaled by FV_SCALE, exactly like the rest of the summation
+//     (`score += MATERIAL * FV_SCALE;` in genuine Bonanza).
 
 namespace {
 
@@ -221,6 +234,8 @@ std::vector<std::string> build_discovery_candidates() {
 
 // -----------------------------------------------------------------------
 // Bonanza feature-space constants (see file header comment for provenance).
+// These are the KPP (full fe_end) feature offsets: verbatim from genuine
+// Bonanza 6.0 (src/client/shogi.h).
 // -----------------------------------------------------------------------
 enum {
     f_hand_pawn = 0,   e_hand_pawn = 19,  f_hand_lance = 38,  e_hand_lance = 43,
@@ -235,18 +250,35 @@ enum {
     f_dragon = 1314, e_dragon = 1395, fe_end = 1476
 };
 
+// KKP-specific (halved, kkp_end == fe_end/2) feature offsets: also
+// verbatim from genuine Bonanza 6.0 (src/client/shogi.h). KKP does not
+// distinguish "own" (f_) vs "enemy" (e_) pieces with separate offsets the
+// way KPP does — that distinction is carried instead by which king-pair
+// (own unmirrored vs opponent mirrored) is used to index the table, and
+// by whether the resulting term is added or subtracted (see evaluate()).
+enum {
+    kkp_hand_pawn = 0,  kkp_hand_lance = 19, kkp_hand_knight = 24,
+    kkp_hand_silver = 29, kkp_hand_gold = 34, kkp_hand_bishop = 39,
+    kkp_hand_rook = 42, kkp_hand_end = 45,
+
+    kkp_pawn = 36, kkp_lance = 108, kkp_knight = 171, kkp_silver = 252,
+    kkp_gold = 333, kkp_bishop = 414, kkp_horse = 495, kkp_rook = 576,
+    kkp_dragon = 657, kkp_end = 738
+};
+
 constexpr int64_t SQ_NB   = 81;
 constexpr int64_t POS_N   = static_cast<int64_t>(fe_end) * (fe_end + 1) / 2;
 constexpr int64_t KPP_CNT = SQ_NB * POS_N;
-constexpr int64_t KKP_CNT = SQ_NB * SQ_NB * static_cast<int64_t>(fe_end);
-constexpr int64_t KK_CNT  = SQ_NB * SQ_NB;
-constexpr int64_t KP_CNT  = SQ_NB * static_cast<int64_t>(fe_end);
+constexpr int64_t KKP_CNT = SQ_NB * SQ_NB * static_cast<int64_t>(kkp_end);
 
 constexpr int64_t KPP_BYTES = KPP_CNT * static_cast<int64_t>(sizeof(int16_t));
-constexpr int64_t KKP_BYTES = KKP_CNT * static_cast<int64_t>(sizeof(int32_t));
-constexpr int64_t KK_BYTES  = KK_CNT  * static_cast<int64_t>(sizeof(int32_t));
-constexpr int64_t KP_BYTES  = KP_CNT  * static_cast<int64_t>(sizeof(int32_t));
-constexpr int64_t FV_BIN_BYTES = KPP_BYTES + KKP_BYTES + KK_BYTES + KP_BYTES; // 215,824,824
+constexpr int64_t KKP_BYTES = KKP_CNT * static_cast<int64_t>(sizeof(int16_t));
+constexpr int64_t FV_BIN_BYTES = KPP_BYTES + KKP_BYTES; // 186,268,248
+
+// Size of the previous (incorrect) 215,824,824-byte assumption, kept only
+// so a file of that size can be reported with a specific, actionable
+// message instead of a generic "invalid size" one (see try_load_from_path).
+constexpr int64_t LEGACY_APERY_LAYOUT_BYTES = 215824824;
 
 // Piece values used for the material term. Used as the *entire* score for
 // MATERIAL_FALLBACK (no valid fv.bin present), and as an additive term
@@ -270,10 +302,8 @@ constexpr int64_t FV_SCALE = 32;
 // Global state
 // -----------------------------------------------------------------------
 struct FvTables {
-    std::vector<int16_t> kpp; // [SQ_NB][pos_n]                (triangular)
-    std::vector<int32_t> kkp; // [SQ_NB][SQ_NB][fe_end]
-    std::vector<int32_t> kk;  // [SQ_NB][SQ_NB]
-    std::vector<int32_t> kp;  // [SQ_NB][fe_end]
+    std::vector<int16_t> kpp; // [SQ_NB][pos_n]     (triangular, full fe_end space)
+    std::vector<int16_t> kkp; // [SQ_NB][SQ_NB][kkp_end]
 };
 
 bool        g_loaded_once   = false;
@@ -307,16 +337,52 @@ inline int64_t triangular_index(int a, int b) {
     return static_cast<int64_t>(hi) * (hi + 1) / 2 + lo;
 }
 
-// Note: the KK and KP tables are intentionally loaded (to validate the
-// on-disk file's size/layout, since they are genuinely part of a real
-// fv.bin) but never looked up here — neither reference implementation
-// cited in the file header comment ever reads them when scoring a
-// position, so no kk_lookup()/kp_lookup() helpers are defined.
-inline int kkp_lookup(int my_king, int opp_king, int fe) {
-    return g_tables.kkp[(static_cast<int64_t>(my_king) * SQ_NB + opp_king) * fe_end + fe];
+// KKP table lookup: `idx` must already be a kkp-space index (either
+// kkp_hand_<piece> + hand-count, or kkp_<piece> + a board square — see
+// hand_kkp_base()/board_kkp_base() below), NOT a full fe_end feature id.
+inline int kkp_lookup(int my_king, int opp_king, int idx) {
+    return g_tables.kkp[(static_cast<int64_t>(my_king) * SQ_NB + opp_king) * kkp_end + idx];
 }
 inline int kpp_lookup(int my_king, int fe_a, int fe_b) {
     return g_tables.kpp[static_cast<int64_t>(my_king) * POS_N + triangular_index(fe_a, fe_b)];
+}
+
+// kkp-space base offset for one unit of a hand piece (own/enemy is NOT
+// distinguished here — see file header comment).
+int hand_kkp_base(PieceType pt) {
+    switch (pt) {
+        case PAWN:   return kkp_hand_pawn;
+        case LANCE:  return kkp_hand_lance;
+        case KNIGHT: return kkp_hand_knight;
+        case SILVER: return kkp_hand_silver;
+        case GOLD:   return kkp_hand_gold;
+        case BISHOP: return kkp_hand_bishop;
+        case ROOK:   return kkp_hand_rook;
+        default:     return -1;
+    }
+}
+
+// kkp-space base offset for a board piece (own/enemy is NOT distinguished
+// here — see file header comment). Promoted minor pieces share GOLD's
+// slot (they move like GOLD in Bonanza's feature space); promoted
+// bishop/rook use HORSE/DRAGON, matching board_feature_base() below.
+int board_kkp_base(PieceType pt) {
+    switch (pt) {
+        case PAWN:        return kkp_pawn;
+        case LANCE:       return kkp_lance;
+        case KNIGHT:      return kkp_knight;
+        case SILVER:      return kkp_silver;
+        case GOLD:        return kkp_gold;
+        case PROM_PAWN:   return kkp_gold;
+        case PROM_LANCE:  return kkp_gold;
+        case PROM_KNIGHT: return kkp_gold;
+        case PROM_SILVER: return kkp_gold;
+        case BISHOP:      return kkp_bishop;
+        case PROM_BISHOP: return kkp_horse;
+        case ROOK:        return kkp_rook;
+        case PROM_ROOK:   return kkp_dragon;
+        default:          return -1;
+    }
 }
 
 // Base feature offset (own="f_", enemy="e_") for one unit of a hand piece.
@@ -415,6 +481,22 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
     ifs.seekg(0, std::ios::beg);
 
     if (size != static_cast<std::streamoff>(FV_BIN_BYTES)) {
+        if (size == static_cast<std::streamoff>(LEGACY_APERY_LAYOUT_BYTES)) {
+            // Explicitly recognized: this is the size a previous version of
+            // this loader incorrectly assumed for "Bonanza v6" (based on a
+            // converter tool's expanded in-memory struct sizes, not genuine
+            // Bonanza's own on-disk format). Report this distinctly instead
+            // of a generic size mismatch, since it is a known-but-unsupported
+            // layout rather than an arbitrary wrong-sized file.
+            g_status = "material-only fallback (unsupported fv.bin layout: got "
+                     + std::to_string(static_cast<long long>(size))
+                     + " bytes, which matches the Apery bonanzatoapery converter's "
+                       "expanded KKP/KK/KP layout, not genuine Bonanza v6's own "
+                       "186,268,248-byte KPP+KKP layout; source: "
+                     + path + " [" + tag + "])";
+            g_family = EvalFamily::MATERIAL_FALLBACK;
+            return false;
+        }
         g_status = "material-only fallback (invalid Bonanza v6 fv.bin size: got "
                  + std::to_string(static_cast<long long>(size)) + " bytes, expected "
                  + std::to_string(static_cast<long long>(FV_BIN_BYTES)) + " bytes; source: "
@@ -426,13 +508,9 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
     FvTables loaded;
     loaded.kpp.resize(static_cast<size_t>(KPP_CNT));
     loaded.kkp.resize(static_cast<size_t>(KKP_CNT));
-    loaded.kk.resize(static_cast<size_t>(KK_CNT));
-    loaded.kp.resize(static_cast<size_t>(KP_CNT));
 
     ifs.read(reinterpret_cast<char*>(loaded.kpp.data()), KPP_BYTES);
     ifs.read(reinterpret_cast<char*>(loaded.kkp.data()), KKP_BYTES);
-    ifs.read(reinterpret_cast<char*>(loaded.kk.data()),  KK_BYTES);
-    ifs.read(reinterpret_cast<char*>(loaded.kp.data()),  KP_BYTES);
 
     if (!ifs) {
         g_status = "material-only fallback (failed to read fv.bin: " + path + ")";
@@ -443,7 +521,8 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
     g_tables = std::move(loaded);
     const std::string abs_path = make_absolute_path(path);
     g_status = "bonanza-v6 fv.bin loaded from " + (abs_path.empty() ? path : abs_path) + " [" + tag
-             + "] [family=BONANZA_V6_FV]";
+             + "] [family=BONANZA_V6_FV] [size=" + std::to_string(static_cast<long long>(size))
+             + " bytes] [fv_scale=" + std::to_string(static_cast<long long>(FV_SCALE)) + "]";
     g_family = EvalFamily::BONANZA_V6_FV;
     return true;
 }
@@ -546,9 +625,10 @@ int evaluate(const Board& board) {
     // Bonanza-v6 KPP/KKP evaluation. Always accumulated from Black's point
     // of view, then negated at the very end if White is to move — exactly
     // like genuine Bonanza (see file header comment for the exact formula
-    // and its provenance from two independent reference implementations).
+    // and its provenance).
     const int sq_bk     = to_bonanza_sq(board.king_sq(BLACK));
     const int sq_wk     = to_bonanza_sq(board.king_sq(WHITE));
+    const int sq_bk_inv = mirror_sq(sq_bk);
     const int sq_wk_inv = mirror_sq(sq_wk);
 
     // list0: every non-king piece, expressed from Black's own point of
@@ -560,23 +640,44 @@ int evaluate(const Board& board) {
 
     int64_t score = static_cast<int64_t>(material_black) * FV_SCALE;
 
-    // One KKP term per piece, using Black's own king/opponent-king squares
-    // (unmirrored) and Black's own feature index — never the White-view
-    // list, and never negated.
-    for (size_t i = 0; i < list0.size(); ++i) {
-        score += kkp_lookup(sq_bk, sq_wk, list0[i]);
+    // KKP term: exactly one lookup per non-king piece (hand or board),
+    // ADDED for Black's own pieces (looked up at the unmirrored
+    // (SQ_BKING, SQ_WKING) king pair) and SUBTRACTED for White's own
+    // pieces (looked up at the mirrored (Inv(SQ_WKING), Inv(SQ_BKING))
+    // king pair, with the board square itself also mirrored) — exactly
+    // matching genuine Bonanza's make_list() (see file header comment).
+    for (int pt = PAWN; pt <= ROOK; ++pt) {
+        const int hb = hand_kkp_base(static_cast<PieceType>(pt));
+        if (hb < 0) continue;
+        score += kkp_lookup(sq_bk, sq_wk, hb + board.hand(BLACK, static_cast<PieceType>(pt)));
+        score -= kkp_lookup(sq_wk_inv, sq_bk_inv, hb + board.hand(WHITE, static_cast<PieceType>(pt)));
+    }
+    for (int s = 0; s < SQUARE_NB; ++s) {
+        const Piece p = board.piece_at(s);
+        if (p == NO_PIECE || type_of(p) == KING) continue;
+        const int bb = board_kkp_base(type_of(p));
+        if (bb < 0) continue;
+        const int bsq = to_bonanza_sq(static_cast<Square>(s));
+        if (color_of(p) == BLACK) {
+            score += kkp_lookup(sq_bk, sq_wk, bb + bsq);
+        } else {
+            score -= kkp_lookup(sq_wk_inv, sq_bk_inv, bb + mirror_sq(bsq));
+        }
     }
 
     // Two-piece KPP term, summed once from Black's own point of view and
     // once from White's (mirrored) point of view, with the second pass
-    // SUBTRACTED rather than added.
+    // SUBTRACTED rather than added. Every unordered pair (i, j) with
+    // i >= j is included, INCLUDING the diagonal i == j (a single-piece
+    // "self" term folded into the triangular table) — genuine Bonanza's
+    // loop is `for (j = 0; j <= i; j++)`, not `j < i`.
     for (size_t i = 0; i < list0.size(); ++i) {
-        for (size_t j = 0; j < i; ++j) {
+        for (size_t j = 0; j <= i; ++j) {
             score += kpp_lookup(sq_bk, list0[i], list0[j]);
         }
     }
     for (size_t i = 0; i < list1.size(); ++i) {
-        for (size_t j = 0; j < i; ++j) {
+        for (size_t j = 0; j <= i; ++j) {
             score -= kpp_lookup(sq_wk_inv, list1[i], list1[j]);
         }
     }
