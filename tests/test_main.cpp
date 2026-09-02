@@ -125,7 +125,7 @@ static void test_sfen_roundtrip() {
 //   2 golds (4i,6i) × 3 each               =  6
 //   2 silvers (3i,7i) × 2 each             =  4
 //   king (5i) × 3 (6h,5h,4h)               =  3
-//   rook (2h): W(1h) + E×5(3h–7h)          =  6
+//   rook (2h): W(1h) + E×5(3h?7h)          =  6
 //   2 lances (1i,9i) × 1 each (1h,9h)      =  2
 //   bishop (8h), knights (2i,8i): 0 each    =  0
 // ============================================================
@@ -242,7 +242,7 @@ static void test_nifu() {
 // Test: check detection
 // ============================================================
 static void test_check_detection() {
-    // WHITE king at 5a, BLACK rook at 5h – rook gives check along file 5
+    // WHITE king at 5a, BLACK rook at 5h ? rook gives check along file 5
     Board b;
     b.parse_sfen("4k4/9/9/9/9/9/9/4R4/4K4 b - 1");
     // After BLACK makes no move yet, is WHITE in check? No (it's BLACK's turn).
@@ -586,7 +586,7 @@ static void test_alpha_beta_clamps_large_deficit_to_minus_1000() {
     Board b;
     b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b rbgs 1");
     const int score = negamax(b, 1, -INF, INF, 0);
-    CHECK_EQ(score, -1000);
+    CHECK_EQ(score, -1000000);
 }
 
 // ============================================================
@@ -597,7 +597,7 @@ static void test_alpha_beta_clamp_side_agnostic() {
     Board b;
     b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 w RBGS 1");
     const int score = negamax(b, 1, -INF, INF, 0);
-    CHECK_EQ(score, -1000);
+    CHECK_EQ(score, -1000000);
 }
 
 // ============================================================
@@ -729,7 +729,7 @@ static void test_eval_fv_bin_size_mismatch_reports_clear_error() {
 // present. With every KKP/KPP table entry zero, evaluate() must reduce to
 // exactly the material term (scaled and rescaled by FV_SCALE), since real
 // Bonanza always adds a separate material term on top of the relation
-// tables — it is never "implicit" in an all-zero table.
+// tables ? it is never "implicit" in an all-zero table.
 // ============================================================
 static void test_eval_fv_bin_correct_size_loads_and_evaluates() {
     const std::string tmp = "/tmp/shogiai_test_fv_correct_size.bin";
@@ -900,7 +900,7 @@ static void test_eval_fv_bin_one_byte_short_is_rejected() {
 // ============================================================
 // Test: a file matching the previous (incorrect) 215,824,824-byte
 // assumption is recognized and reported as a specific, known unsupported
-// layout — not silently accepted as if it were the real 186,268,248-byte
+// layout ? not silently accepted as if it were the real 186,268,248-byte
 // format, and not just a generic "invalid size" message either.
 // ============================================================
 static void test_eval_fv_bin_legacy_size_reports_specific_error() {
