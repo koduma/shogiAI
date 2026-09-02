@@ -4,17 +4,25 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <vector>
 
-#if defined(__linux__)
-#include <unistd.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#elif defined(_WIN32)
+// -----------------------------------------------------------------------
+// Deliberately no <filesystem>: this file must compile with plain C++11
+// (including older MinGW toolchains without <filesystem>/experimental
+// filesystem support). All path handling below is implemented with a
+// handful of small helpers on top of POSIX (readlink/realpath/getcwd) or
+// Win32 (GetModuleFileNameA/GetFullPathNameA) APIs instead.
+// -----------------------------------------------------------------------
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <climits>  // PATH_MAX
+#include <unistd.h> // readlink, realpath, getcwd
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 // ============================================================
@@ -90,14 +98,47 @@ namespace {
 #define SHOGIAI_SOURCE_DIR ""
 #endif
 
+// Portable (filesystem-free) path helpers
+// -----------------------------------------------------------------------
+// Minimal replacements for the small subset of std::filesystem::path
+// functionality this file needs (parent_path()/canonical()/absolute()),
+// implemented with plain C++11 + POSIX/Win32 APIs so this translation
+// unit compiles without <filesystem> (unavailable on some older MinGW
+// toolchains and pre-C++17 standard libraries).
+// -----------------------------------------------------------------------
+#if !defined(_WIN32) && !defined(PATH_MAX)
+#define PATH_MAX 4096
+#endif
+
+// Directory part of `path` (everything before the last '/' or '\\'), or
+// "" if there is no separator. Mirrors std::filesystem::path::parent_path()
+// closely enough for building discovery candidates below.
+std::string path_parent_dir(const std::string& path) {
+    const std::string::size_type pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) return std::string();
+    if (pos == 0) return path.substr(0, 1); // root, e.g. "/"
+    return path.substr(0, pos);
+}
+
+#if !defined(_WIN32)
+// Resolves symlinks / "." / ".." components, matching what
+// std::filesystem::canonical() did for the POSIX branches below. Requires
+// the path to exist (both call sites here only use it on paths that are
+// already known to exist). Falls back to the input path unchanged if
+// resolution fails.
+std::string canonicalize_existing_path(const std::string& path) {
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) != nullptr) return std::string(resolved);
+    return path;
+}
+#endif
+
 // Directory containing the running executable, or "" if it cannot be
 // determined on this platform. Used to build cwd-independent discovery
 // candidates relative to where the binary actually lives (e.g. the CMake
 // build tree), which matters because most USI GUIs launch the engine with
 // an arbitrary working directory, not the build or repository directory.
 std::string get_executable_dir() {
-    namespace fs = std::filesystem;
-    std::error_code ec;
 #if defined(__linux__)
     char buf[4096];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -106,17 +147,13 @@ std::string get_executable_dir() {
     // "undeterminable" rather than risk a corrupted/truncated path.
     if (len > 0 && len < static_cast<ssize_t>(sizeof(buf) - 1)) {
         buf[len] = '\0';
-        fs::path p = fs::canonical(fs::path(buf), ec);
-        if (ec) p = fs::path(buf);
-        return p.parent_path().string();
+        return path_parent_dir(canonicalize_existing_path(buf));
     }
 #elif defined(__APPLE__)
     char buf[4096];
     uint32_t size = sizeof(buf);
     if (_NSGetExecutablePath(buf, &size) == 0) {
-        fs::path p = fs::canonical(fs::path(buf), ec);
-        if (ec) p = fs::path(buf);
-        return p.parent_path().string();
+        return path_parent_dir(canonicalize_existing_path(buf));
     }
 #elif defined(_WIN32)
     char buf[MAX_PATH];
@@ -126,11 +163,24 @@ std::string get_executable_dir() {
     // when the path doesn't fit, without len reaching MAX_PATH; checking
     // GetLastError() for ERROR_INSUFFICIENT_BUFFER catches that case too.
     if (len > 0 && len < MAX_PATH && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        fs::path p(buf);
-        return p.parent_path().string();
+        return path_parent_dir(std::string(buf));
     }
 #endif
     return "";
+}
+
+// Best-effort absolute form of `path` (used only for cosmetic status
+// messages, so falling back to the original relative path on failure is
+// acceptable). `path` is expected to already exist at the call site.
+std::string make_absolute_path(const std::string& path) {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    const DWORD len = GetFullPathNameA(path.c_str(), MAX_PATH, buf, nullptr);
+    if (len > 0 && len < MAX_PATH) return std::string(buf);
+    return path;
+#else
+    return canonicalize_existing_path(path);
+#endif
 }
 
 // -----------------------------------------------------------------------
@@ -391,9 +441,8 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
     }
 
     g_tables = std::move(loaded);
-    std::error_code ec;
-    const std::string abs_path = std::filesystem::absolute(std::filesystem::path(path), ec).string();
-    g_status = "bonanza-v6 fv.bin loaded from " + (ec ? path : abs_path) + " [" + tag
+    const std::string abs_path = make_absolute_path(path);
+    g_status = "bonanza-v6 fv.bin loaded from " + (abs_path.empty() ? path : abs_path) + " [" + tag
              + "] [family=BONANZA_V6_FV]";
     g_family = EvalFamily::BONANZA_V6_FV;
     return true;
