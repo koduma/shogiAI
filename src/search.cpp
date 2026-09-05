@@ -63,7 +63,7 @@ std::array<TTEntry, TT_SIZE> g_tt{};
 uint16_t g_tt_generation = 1;
 
 constexpr std::array<int, PT_NB> PIECE_VALUE = {
-    0, 100, 300, 300, 500, 600, 800, 1000, 0, 600, 600, 600, 600, 1100, 1300
+    0, 87, 232, 257, 369, 444, 569, 642, 0, 534, 489, 510, 495, 827, 945 
 };
 
 inline int elapsed_ms() {
