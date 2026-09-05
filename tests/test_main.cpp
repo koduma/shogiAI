@@ -365,6 +365,16 @@ static void test_quiescence_tactical_extension() {
 }
 
 // ============================================================
+// Test: quiescence search must consider quiet checking moves
+// ============================================================
+static void test_quiescence_considers_quiet_checks() {
+    Board b;
+    b.parse_sfen("PUT_REAL_SFEN_HERE");
+    const Move best = iterative_deepening(b, 500);
+    CHECK_EQ(best, usi_to_move("PUT_BESTMOVE_HERE"));
+}
+
+// ============================================================
 // Test: iterative search prefers the immediate tactical gain
 // ============================================================
 static void test_search_tactical_regression() {
