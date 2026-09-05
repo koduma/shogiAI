@@ -506,11 +506,47 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
         alpha = std::max(alpha, stand_pat);
     }
 
+    //MoveList legal_moves;
+    //generate_legal_moves(board, legal_moves);
+    //if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
+
+    //auto ordered = order_moves(board, legal_moves, ply, hash_move, !in_check);
+    //if (ordered.empty()) return clamp_eval_score(stand_pat);
+
     MoveList legal_moves;
     generate_legal_moves(board, legal_moves);
-    if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
+    if (legal_moves.empty()) {
+    return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
+    }
+    auto ordered = order_moves(board, legal_moves, ply, hash_move, false);
+    if (!in_check) {
+        ordered.erase(
+        std::remove_if(
+            ordered.begin(), ordered.end(),
+            [&board](const ScoredMove& scored) {
+                const Move m = scored.move;
+                if (is_tactical_move(board, m)) {
+                    return false;
+                }
 
-    auto ordered = order_moves(board, legal_moves, ply, hash_move, !in_check);
+                board.do_move(m);
+                const bool gives_check = board.in_check();
+                board.undo_move(m);
+                return !gives_check;
+            }),
+        ordered.end());
+        for (ScoredMove& scored : ordered) {
+        if (!is_tactical_move(board, scored.move)) {
+            scored.score += CHECK_BONUS;
+        }
+        }
+        
+        std::sort(
+        ordered.begin(), ordered.end(),
+        [](const ScoredMove& lhs, const ScoredMove& rhs) {
+            return lhs.score > rhs.score;
+        });
+    }
     if (ordered.empty()) return clamp_eval_score(stand_pat);
 
     int best_score = in_check ? -INF : stand_pat;
