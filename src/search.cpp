@@ -313,8 +313,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // Skip our turn and see if the opponent can still stay below beta.
     // Safe conditions: not PV, not in check, no consecutive null moves,
     // depth >= 3, not a potential zugzwang (we have non-king/pawn material).
-    //if (!is_pv && !in_check && !no_null && depth >= 3) {
-    if (false && !is_pv && !in_check && !no_null && depth >= 3) {
+    if (!is_pv && !in_check && !no_null && depth >= 3) {
         // Quick material check to avoid null move in zugzwang-prone positions
         bool has_major = false;
         const Color us = board.side_to_move();
@@ -366,10 +365,8 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     }
 
     // Pre-compute static eval for futility pruning (only at shallow non-PV nodes).
-    //const bool use_futility = (!is_pv && !in_check && depth <= 2);
-    //const int  futility_eval = use_futility ? evaluate(board) : -INF;
-    const bool use_futility = false;
-    const int  futility_eval = -INF;
+    const bool use_futility = (!is_pv && !in_check && depth <= 2);
+    const int  futility_eval = use_futility ? evaluate(board) : -INF;
 
     auto ordered = order_moves(board, legal_moves, ply, hash_move, false);
     int best_score = -INF;
@@ -401,7 +398,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             // Reduce quiet, non-killer, non-hash moves later in the list.
             int lmr_depth = depth - 1;
             bool did_lmr  = false;
-            if (!in_check && depth >= 5 && searched_count >= 4 &&
+            if (!in_check && depth >= 3 && searched_count >= 2 &&
                 !is_tactical && m != hash_move &&
                 searched_count < MAX_DEPTH && depth < MAX_DEPTH) {
                 const int reduction = lmr_table[depth][searched_count];
