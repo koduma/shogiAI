@@ -16,6 +16,7 @@ constexpr uint64_t TIME_CHECK_MASK = 0xFFF;
 constexpr int MATE_SCORE_THRESHOLD = MATE_VALUE - MAX_DEPTH;
 constexpr int HASH_MOVE_BONUS = 20'000'000;
 constexpr int CAPTURE_BONUS   = 10'000'000;
+constexpr int CHECK_BONUS     = 5'500'000;
 constexpr int PROMOTION_BONUS = 6'000'000;
 constexpr int KILLER_1_BONUS  = 5'000'000;
 constexpr int KILLER_2_BONUS  = 4'900'000;
