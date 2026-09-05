@@ -1062,6 +1062,7 @@ int main() {
     test_lmr_preserves_tactical_best_move();
     test_alpha_beta_clamps_large_deficit_to_minus_1000();
     test_alpha_beta_clamp_side_agnostic();
+    test_quiescence_considers_quiet_checks();
 
     // Eval file discovery and loading tests
     test_eval_fv_bin_file_not_found();
