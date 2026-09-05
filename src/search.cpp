@@ -16,7 +16,6 @@ constexpr uint64_t TIME_CHECK_MASK = 0xFFF;
 constexpr int MATE_SCORE_THRESHOLD = MATE_VALUE - MAX_DEPTH;
 constexpr int HASH_MOVE_BONUS = 20'000'000;
 constexpr int CAPTURE_BONUS   = 10'000'000;
-constexpr int CHECK_BONUS     = 5'500'000;
 constexpr int PROMOTION_BONUS = 6'000'000;
 constexpr int KILLER_1_BONUS  = 5'000'000;
 constexpr int KILLER_2_BONUS  = 4'900'000;
@@ -506,47 +505,11 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
         alpha = std::max(alpha, stand_pat);
     }
 
-    //MoveList legal_moves;
-    //generate_legal_moves(board, legal_moves);
-    //if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
-
-    //auto ordered = order_moves(board, legal_moves, ply, hash_move, !in_check);
-    //if (ordered.empty()) return clamp_eval_score(stand_pat);
-
     MoveList legal_moves;
     generate_legal_moves(board, legal_moves);
-    if (legal_moves.empty()) {
-    return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
-    }
-    auto ordered = order_moves(board, legal_moves, ply, hash_move, false);
-    if (!in_check) {
-        ordered.erase(
-        std::remove_if(
-            ordered.begin(), ordered.end(),
-            [&board](const ScoredMove& scored) {
-                const Move m = scored.move;
-                if (is_tactical_move(board, m)) {
-                    return false;
-                }
+    if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
 
-                board.do_move(m);
-                const bool gives_check = board.in_check();
-                board.undo_move(m);
-                return !gives_check;
-            }),
-        ordered.end());
-        for (ScoredMove& scored : ordered) {
-        if (!is_tactical_move(board, scored.move)) {
-            scored.score += CHECK_BONUS;
-        }
-        }
-        
-        std::sort(
-        ordered.begin(), ordered.end(),
-        [](const ScoredMove& lhs, const ScoredMove& rhs) {
-            return lhs.score > rhs.score;
-        });
-    }
+    auto ordered = order_moves(board, legal_moves, ply, hash_move, !in_check);
     if (ordered.empty()) return clamp_eval_score(stand_pat);
 
     int best_score = in_check ? -INF : stand_pat;
