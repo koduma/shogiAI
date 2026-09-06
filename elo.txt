@@ -1,4 +1,4 @@
-現状
+copilotへの指示内容
 
 評価関数:fv.bin
 駒割:bonanza6.0
