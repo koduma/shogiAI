@@ -9,6 +9,16 @@
 struct StateInfo {
     Piece    captured;   // piece that was on the destination square (NO_PIECE if none)
     uint64_t hash;       // Zobrist hash *before* the move
+    Color    mover = BLACK;
+    bool     gave_check = false;
+    bool     null_move = false;
+};
+
+enum class RepetitionResult : int {
+    NONE = 0,
+    DRAW,
+    SIDE_TO_MOVE_WINS,
+    SIDE_TO_MOVE_LOSES = -1,
 };
 
 // ============================================================
@@ -35,7 +45,7 @@ public:
     std::string to_sfen() const;
 
     // Move execution
-    void do_move  (Move m);
+    void do_move  (Move m, bool record_check = true);
     void undo_move(Move m);
 
     // Queries
@@ -52,6 +62,7 @@ public:
 
     // Repetition
     int  repetition_count() const;
+    RepetitionResult repetition_result() const;
 
     // Debug
     void print() const;

@@ -499,6 +499,76 @@ static void test_search_info_callback() {
 }
 
 // ============================================================
+// Test: fourfold repetition distinguishes continuous-check loss
+// ============================================================
+static void test_perpetual_check_repetition() {
+    Board b;
+    b.parse_sfen("4k4/4R4/9/9/9/9/9/9/K8 w - 1");
+
+    const char* cycle[] = {"5a4a", "5b4b", "4a5a", "4b5b"};
+    for (int repetition = 0; repetition < 3; ++repetition) {
+        for (const char* usi : cycle) {
+            MoveList legal;
+            generate_legal_moves(b, legal);
+            const Move move = usi_to_move(usi);
+            bool found = false;
+            for (Move candidate : legal)
+                if (candidate == move) found = true;
+            CHECK(found);
+            if (found) b.do_move(move);
+        }
+    }
+
+    CHECK_EQ(b.repetition_count(), 4);
+    CHECK(b.repetition_result() == RepetitionResult::SIDE_TO_MOVE_WINS);
+    CHECK_EQ(negamax(b, 1, -INF, INF, 0), MATE_VALUE);
+}
+
+// ============================================================
+// Test: ordinary fourfold repetition remains a draw
+// ============================================================
+static void test_fourfold_repetition_draw() {
+    Board b;
+    b.parse_sfen("4k4/9/9/9/9/9/9/9/K8 w - 1");
+
+    const char* cycle[] = {"5a4a", "9i8i", "4a5a", "8i9i"};
+    for (int repetition = 0; repetition < 3; ++repetition) {
+        for (const char* usi : cycle) {
+            MoveList legal;
+            generate_legal_moves(b, legal);
+            const Move move = usi_to_move(usi);
+            bool found = false;
+            for (Move candidate : legal)
+                if (candidate == move) found = true;
+            CHECK(found);
+            if (found) b.do_move(move);
+        }
+    }
+
+    CHECK_EQ(b.repetition_count(), 4);
+    CHECK(b.repetition_result() == RepetitionResult::DRAW);
+    CHECK_EQ(negamax(b, 1, -INF, INF, 0), 0);
+}
+
+// ============================================================
+// Test: root info is emitted only for completed iterations
+// ============================================================
+static void test_search_info_uses_completed_iteration() {
+    Board b;
+    b.set_startpos();
+    std::vector<SearchInfo> infos;
+    const Move best = iterative_deepening(b, 1000, [&](const SearchInfo& info) {
+        infos.push_back(info);
+        g_stop.store(true, std::memory_order_relaxed);
+    });
+
+    CHECK(!infos.empty());
+    CHECK_EQ(infos.size(), 1u);
+    CHECK(!infos.empty() && !infos.front().pv.empty());
+    CHECK(!infos.empty() && infos.front().pv.front() == best);
+}
+
+// ============================================================
 // Test: null move pruning fires (threshold_cutoffs > 0).
 // Uses the starting position with a moderate budget so the
 // engine reaches depth >= 5, where NMP and futility both engage.
@@ -1046,6 +1116,9 @@ int main() {
     test_time_allocation_reasonable();
     test_alpha_beta_cutoff_stats();
     test_search_info_callback();
+    test_perpetual_check_repetition();
+    test_fourfold_repetition_draw();
+    test_search_info_uses_completed_iteration();
     test_null_move_pruning_fires();
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();

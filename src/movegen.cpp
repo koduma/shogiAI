@@ -230,7 +230,7 @@ void generate_legal_moves(Board& board, MoveList& out) {
     Color us = board.side_to_move();
 
     for (Move m : pseudo) {
-        board.do_move(m);
+        board.do_move(m, false);
 
         // Own king must not be in check after the move
         bool legal = !board.is_attacked(board.king_sq(us), ~us);
@@ -246,7 +246,7 @@ void generate_legal_moves(Board& board, MoveList& out) {
                 Color them = board.side_to_move(); // after do_move it's their turn
                 bool has_escape = false;
                 for (Move om : opp) {
-                    board.do_move(om);
+                    board.do_move(om, false);
                     if (!board.is_attacked(board.king_sq(them), ~them))
                         has_escape = true;
                     board.undo_move(om);

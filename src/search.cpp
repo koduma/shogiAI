@@ -273,7 +273,10 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     g_seldepth = std::max(g_seldepth, ply);
     if (ply < MAX_DEPTH) g_pv_len[ply] = ply;
 
-    if (board.repetition_count() >= 4) return 0;
+    const RepetitionResult repetition = board.repetition_result();
+    if (repetition == RepetitionResult::DRAW) return 0;
+    if (repetition == RepetitionResult::SIDE_TO_MOVE_WINS) return MATE_VALUE - ply;
+    if (repetition == RepetitionResult::SIDE_TO_MOVE_LOSES) return -(MATE_VALUE - ply);
 
     if (depth <= 0) return quiescence(board, alpha, beta, ply);
 
@@ -332,15 +335,22 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             const int R = 3 + depth / 6;
 
             // Do null move: flip side to move and update hash.
+            StateInfo null_state{};
+            null_state.hash = board.hash_;
+            null_state.captured = NO_PIECE;
+            null_state.mover = board.stm_;
+            null_state.null_move = true;
             board.stm_  = ~board.stm_;
             board.hash_ ^= Zobrist::side;
             board.ply_++;
+            board.history_.push_back(null_state);
             board.pos_hashes_.push_back(board.hash_);
 
             const int null_score = -search(board, depth - 1 - R, -beta, -beta + 1, ply + 1, true);
 
             // Undo null move.
             board.pos_hashes_.pop_back();
+            board.history_.pop_back();
             board.ply_--;
             board.hash_ ^= Zobrist::side;
             board.stm_  = ~board.stm_;
@@ -475,7 +485,10 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
     g_seldepth = std::max(g_seldepth, ply);
     if (ply < MAX_DEPTH) g_pv_len[ply] = ply;
 
-    if (board.repetition_count() >= 4) return 0;
+    const RepetitionResult repetition = board.repetition_result();
+    if (repetition == RepetitionResult::DRAW) return 0;
+    if (repetition == RepetitionResult::SIDE_TO_MOVE_WINS) return MATE_VALUE - ply;
+    if (repetition == RepetitionResult::SIDE_TO_MOVE_LOSES) return -(MATE_VALUE - ply);
 
     const bool in_check = board.in_check();
     const int original_alpha = alpha;
@@ -610,6 +623,7 @@ Move iterative_deepening(Board& board, int allotted_ms, const std::function<void
         const int beta = INF;
         int current_score = -INF;
         Move current_best = MOVE_NONE;
+        int searched_count = 0;
 
         for (const ScoredMove& scored : ordered) {
             const Move m = scored.move;
@@ -619,8 +633,18 @@ Move iterative_deepening(Board& board, int allotted_ms, const std::function<void
             }
 
             board.do_move(m);
-            const int score = -search(board, depth - 1, -beta, -alpha, 1);
+            int score;
+            if (searched_count == 0) {
+                score = -search(board, depth - 1, -beta, -alpha, 1);
+            } else {
+                score = -search(board, depth - 1, -alpha - 1, -alpha, 1);
+                if (!g_stop.load(std::memory_order_relaxed) &&
+                    score > alpha && score < beta) {
+                    score = -search(board, depth - 1, -beta, -alpha, 1);
+                }
+            }
             board.undo_move(m);
+            ++searched_count;
 
             if (g_stop.load(std::memory_order_relaxed)) break;
 
@@ -636,7 +660,8 @@ Move iterative_deepening(Board& board, int allotted_ms, const std::function<void
 
         if (!g_stop.load(std::memory_order_relaxed) && current_best != MOVE_NONE) best_move = current_best;
 
-        if (info_cb && current_best != MOVE_NONE) {
+        if (!g_stop.load(std::memory_order_relaxed) &&
+            info_cb && current_best != MOVE_NONE) {
             SearchInfo info;
             info.depth = depth;
             info.seldepth = std::max(depth, g_seldepth);
