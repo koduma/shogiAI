@@ -193,13 +193,14 @@ std::string Board::to_sfen() const {
 // ============================================================
 // do_move
 // ============================================================
-void Board::do_move(Move m) {
+void Board::do_move(Move m, bool record_check) {
     StateInfo si;
     si.hash     = hash_;
     si.captured = NO_PIECE;
 
     Color us   = stm_;
     Color them = ~us;
+    si.mover = us;
 
     if (is_drop(m)) {
         PieceType pt = dropped_pt(m);
@@ -255,6 +256,7 @@ void Board::do_move(Move m) {
     stm_  = them;
     ply_++;
 
+    si.gave_check = record_check && in_check();
     history_.push_back(si);
     pos_hashes_.push_back(hash_);
 }
@@ -445,6 +447,44 @@ int Board::repetition_count() const {
     for (uint64_t h : pos_hashes_)
         if (h == hash_) cnt++;
     return cnt;
+}
+
+RepetitionResult Board::repetition_result() const {
+    size_t occurrences[4] = {};
+    size_t count = 0;
+    for (size_t i = pos_hashes_.size(); i > 0 && count < 4; --i) {
+        if (pos_hashes_[i - 1] == hash_)
+            occurrences[3 - count++] = i - 1;
+    }
+    if (count < 4)
+        return RepetitionResult::NONE;
+
+    const size_t first = occurrences[0];
+    bool moved[COLOR_NB] = {false, false};
+    bool checked_every_move[COLOR_NB] = {true, true};
+
+    for (size_t i = first; i + 1 < pos_hashes_.size(); ++i) {
+        if (i >= history_.size() || history_[i].null_move)
+            return RepetitionResult::NONE;
+        const StateInfo& state = history_[i];
+        moved[state.mover] = true;
+        checked_every_move[state.mover] =
+            checked_every_move[state.mover] && state.gave_check;
+    }
+
+    Color checker = BLACK;
+    if (moved[BLACK] && checked_every_move[BLACK] &&
+        !(moved[WHITE] && checked_every_move[WHITE])) {
+        checker = BLACK;
+    } else if (moved[WHITE] && checked_every_move[WHITE] &&
+               !(moved[BLACK] && checked_every_move[BLACK])) {
+        checker = WHITE;
+    } else {
+        return RepetitionResult::DRAW;
+    }
+
+    return checker == stm_ ? RepetitionResult::SIDE_TO_MOVE_LOSES
+                           : RepetitionResult::SIDE_TO_MOVE_WINS;
 }
 
 // ============================================================

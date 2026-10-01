@@ -17,3 +17,12 @@ elo:約1000
 
 |  ex1   | 枝刈りの基礎       | NMP (Null Move Pruning)    | search.cpp 内のパス探索        |   +100 〜 +150    | ツリーの浅い部分でのツークツワン（ZUGZWANG）の誤判定回避とビット演算|
 |  ex2   | 手の順序付け       | History Heuristics         | move_picker.cpp / ヒストリー表 |    +50 〜 +80     | 過去の探索で良さそうだった手を配列にキャッシュし、高速にソートする|
+
+## 実装内容（探索部改善）
+
+| 項番 | 実装ステップ | 専門用語（技術名） | やねうら王での該当箇所（目安） | 期待されるElo向上 | AHCコーダーが注力する実装上の壁 |
+|---|---|---|---|---|---|
+| 1 | `Board::do_move()` で手番側・王手情報を履歴化し、`Board::repetition_result()` と探索・静止探索で4回同一局面を裁定。片側が全手で王手を続けていた場合はその側の負け、通常の千日手は引き分けとした。回帰テスト `test_perpetual_check_repetition` / `test_fourfold_repetition_draw` で確認。 | 千日手・連続王手（Perpetual check） | 探索局面の反復判定・王手履歴（`search.cpp` / position history 相当） | 未測定（要対局検証。棋力向上値ではなくルール正確性の改善） | 王手履歴を合法手生成の一時的な do/undo と区別する必要がある。連続王手側の判定を探索スコアの手番視点に正しく変換すること。 |
+| 2 | Null Move Pruning の仮想手を明示的な履歴要素として記録し、その仮想手を含む反復経路を千日手・連続王手として誤裁定しないようにした（`board.hpp` / `board.cpp` / `search.cpp`）。 | Null-move history isolation | Null-move pruning と repetition detection の境界（`search.cpp`） | 未測定（要対局検証） | 仮想手は探索上の便宜であり、実戦譜の手数・連続王手判定に混入させないこと。 |
+| 3 | 反復深化のrootで初手を全窓、以降をnull-windowで探索し、alphaを超えた場合に全窓で再探索するroot PVSを導入（`iterative_deepening()`）。 | Principal Variation Search（PVS） | Root move loop / PV search（`search.cpp` の探索入口付近） | 未測定（要対局検証。短時間USI測定のみで比較Eloなし） | fail-high時の再探索とalpha更新を欠かすとroot最善手を誤る。既存の合法手順序・TT/PVとの整合が必要。 |
+| 4 | 停止で深さが完了しなかった場合は、その深さの `info` / PV を通知せず、最後に完了した深さの最善手を維持（`iterative_deepening()`）。`test_search_info_uses_completed_iteration` と戦術的最善手テストで確認。 | Iterative deepening / safe interruption | Completed-iteration result publication（`search.cpp` root loop） | 未測定（要対局検証。停止時の出力・選択の正確性改善） | 中断時に部分探索のスコアやPVを確定結果として扱わず、USIへの応答と直前の完了結果を保つこと。 |
