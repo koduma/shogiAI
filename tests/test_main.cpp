@@ -396,9 +396,9 @@ static void test_transposition_table_hits() {
 }
 
 // ============================================================
-// Test: root-search reset keeps deterministic stats between runs
+// Test: retained TT entries remain useful across search generations
 // ============================================================
-static void test_search_reset_deterministic() {
+static void test_transposition_table_reuse_across_generations() {
     Board b1;
     b1.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
     const int score1 = negamax(b1, 3, -INF, INF, 0);
@@ -410,9 +410,37 @@ static void test_search_reset_deterministic() {
     const SearchStats st2 = last_search_stats();
 
     CHECK_EQ(score1, score2);
-    CHECK_EQ(st1.nodes, st2.nodes);
-    CHECK_EQ(st1.qnodes, st2.qnodes);
-    CHECK_EQ(st1.tt_hits, st2.tt_hits);
+    CHECK(st1.tt_probes > 0);
+    CHECK(st2.tt_hits > 0);
+}
+
+// ============================================================
+// Test: aspiration-window failures are widened and completed
+// iterations continue to publish a best move.
+// ============================================================
+static void test_aspiration_window_recovery() {
+    uint64_t fail_low = 0;
+    uint64_t fail_high = 0;
+    for (const char* sfen : {
+             "4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1",
+             "4r4/9/9/9/9/9/9/9/4K4 b - 1"}) {
+        Board b;
+        CHECK(b.parse_sfen(sfen));
+        std::vector<SearchInfo> infos;
+        const Move best = iterative_deepening(b, 1000, [&](const SearchInfo& info) {
+            infos.push_back(info);
+            if (info.depth >= 5) g_stop.store(true, std::memory_order_relaxed);
+        });
+
+        const SearchStats stats = last_search_stats();
+        CHECK(best != MOVE_NONE);
+        CHECK(infos.size() >= 2);
+        CHECK(!infos.empty() && infos.back().pv.front() == best);
+        fail_low += stats.aspiration_fail_low;
+        fail_high += stats.aspiration_fail_high;
+    }
+    CHECK(fail_low > 0);
+    CHECK(fail_high > 0);
 }
 
 // ============================================================
@@ -581,8 +609,19 @@ static void test_null_move_pruning_fires() {
     SearchStats st = last_search_stats();
     // threshold_cutoffs collects both NMP and futility prune counts.
     CHECK(st.threshold_cutoffs > 0);
+    CHECK(st.null_move_verifications > 0);
     // We should reach a reasonable search depth within 500 ms.
     CHECK(!infos.empty() && infos.back().depth >= 8);
+}
+
+// ============================================================
+// Test: shallow late-move pruning is exercised at non-PV nodes.
+// ============================================================
+static void test_late_move_pruning() {
+    Board b;
+    b.set_startpos();
+    (void)negamax(b, 4, -INF, INF, 0);
+    CHECK(last_search_stats().late_move_prunes > 0);
 }
 
 // ============================================================
@@ -1111,7 +1150,8 @@ int main() {
     test_quiescence_tactical_extension();
     test_search_tactical_regression();
     test_transposition_table_hits();
-    test_search_reset_deterministic();
+    test_transposition_table_reuse_across_generations();
+    test_aspiration_window_recovery();
     test_search_respects_movetime();
     test_time_allocation_reasonable();
     test_alpha_beta_cutoff_stats();
@@ -1120,6 +1160,7 @@ int main() {
     test_fourfold_repetition_draw();
     test_search_info_uses_completed_iteration();
     test_null_move_pruning_fires();
+    test_late_move_pruning();
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();
     test_lmr_preserves_tactical_best_move();

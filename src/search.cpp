@@ -20,6 +20,7 @@ constexpr int PROMOTION_BONUS = 6'000'000;
 constexpr int KILLER_1_BONUS  = 5'000'000;
 constexpr int KILLER_2_BONUS  = 4'900'000;
 constexpr size_t TT_SIZE      = 1u << 19; // ~12 MiB, deterministic fixed-size table
+constexpr int MAX_HISTORY     = 16'384;
 
 enum BoundType : uint8_t {
     BOUND_NONE  = 0,
@@ -51,6 +52,10 @@ uint64_t g_threshold_cutoffs = 0;
 uint64_t g_tt_probes         = 0;
 uint64_t g_tt_hits           = 0;
 uint64_t g_tt_cutoffs        = 0;
+uint64_t g_null_move_verifications = 0;
+uint64_t g_late_move_prunes  = 0;
+uint64_t g_aspiration_fail_low = 0;
+uint64_t g_aspiration_fail_high = 0;
 int      g_seldepth          = 0;
 
 std::array<std::array<Move, MAX_DEPTH>, MAX_DEPTH> g_pv{};
@@ -121,7 +126,7 @@ inline TTEntry& tt_slot(uint64_t key) {
 TTEntry* tt_probe(uint64_t key) {
     ++g_tt_probes;
     TTEntry& entry = tt_slot(key);
-    if (entry.generation == g_tt_generation && entry.key == key) {
+    if (entry.bound != BOUND_NONE && entry.key == key) {
         ++g_tt_hits;
         return &entry;
     }
@@ -130,8 +135,14 @@ TTEntry* tt_probe(uint64_t key) {
 
 void tt_store(uint64_t key, int depth, int score, BoundType bound, Move best_move, int ply) {
     TTEntry& entry = tt_slot(key);
-    if (entry.generation == g_tt_generation && entry.key == key &&
-        entry.depth > depth && entry.bound == BOUND_EXACT && bound != BOUND_EXACT) {
+    if (entry.bound != BOUND_NONE && entry.key == key) {
+        if (entry.generation == g_tt_generation && entry.depth > depth &&
+            (entry.bound == BOUND_EXACT || bound != BOUND_EXACT))
+            return;
+        if (best_move == MOVE_NONE) best_move = entry.best_move;
+    }
+    if (entry.generation == g_tt_generation && entry.key != key &&
+        entry.bound != BOUND_NONE && entry.depth > depth + 2 && bound != BOUND_EXACT) {
         return;
     }
 
@@ -182,6 +193,10 @@ void reset_search_state(int allotted_ms) {
     g_tt_probes = 0;
     g_tt_hits = 0;
     g_tt_cutoffs = 0;
+    g_null_move_verifications = 0;
+    g_late_move_prunes = 0;
+    g_aspiration_fail_low = 0;
+    g_aspiration_fail_high = 0;
     g_seldepth = 0;
     g_pv_len.fill(0);
     for (auto& killers : g_killers) killers = {MOVE_NONE, MOVE_NONE};
@@ -207,15 +222,17 @@ void record_killer(int ply, Move m) {
     g_killers[ply][0] = m;
 }
 
-void record_history(Move m, int depth) {
-    const int bonus = std::min(2048, depth * depth + depth * 4);
+void update_history(Move m, int depth, bool good) {
+    int bonus = std::min(2048, depth * depth + depth * 4);
+    if (!good) bonus = -bonus / 2;
+    int* value;
     if (is_drop(m)) {
-        int& v = g_drop_history[dropped_pt(m)][to_sq(m)];
-        v = std::min(1'000'000, v + bonus);
+        value = &g_drop_history[dropped_pt(m)][to_sq(m)];
     } else {
-        int& v = g_history[from_sq(m)][to_sq(m)];
-        v = std::min(1'000'000, v + bonus);
+        value = &g_history[from_sq(m)][to_sq(m)];
     }
+    *value += bonus - (*value * std::abs(bonus)) / MAX_HISTORY;
+    *value = std::clamp(*value, -MAX_HISTORY, MAX_HISTORY);
 }
 
 int capture_score(const Board& board, Move m) {
@@ -289,7 +306,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
 
     if (TTEntry* entry = tt_probe(board.hash())) {
         hash_move = entry->best_move;
-        if (entry->depth >= depth) {
+        if (entry->generation == g_tt_generation && entry->depth >= depth) {
             const int tt_score = tt_probe_score(entry->score, ply);
             if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
             if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
@@ -360,9 +377,14 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             // Verify: avoid returning a mate score from the null search (may be
             // a sign of zugzwang or a TT collision near the root).
             if (null_score >= beta && !is_mate_score(null_score)) {
-                ++g_threshold_cutoffs;
-                tt_store(board.hash(), depth, null_score, BOUND_LOWER, MOVE_NONE, ply);
-                return clamp_eval_score(null_score);
+                ++g_null_move_verifications;
+                const int verify_score = search(board, depth - R, beta - 1, beta, ply, true);
+                if (g_stop.load(std::memory_order_relaxed)) return 0;
+                if (verify_score >= beta && !is_mate_score(verify_score)) {
+                    ++g_threshold_cutoffs;
+                    tt_store(board.hash(), depth, verify_score, BOUND_LOWER, MOVE_NONE, ply);
+                    return clamp_eval_score(verify_score);
+                }
             }
         }
     }
@@ -372,6 +394,9 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     if (legal_moves.empty()) {
         return in_check ? -(MATE_VALUE - ply) : 0;
     }
+    if (hash_move != MOVE_NONE &&
+        std::find(legal_moves.begin(), legal_moves.end(), hash_move) == legal_moves.end())
+        hash_move = MOVE_NONE;
 
     // Pre-compute static eval for futility pruning (only at shallow non-PV nodes).
     const bool use_futility = (!is_pv && !in_check && depth <= 2);
@@ -381,10 +406,21 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     int best_score = -INF;
     Move best_move = MOVE_NONE;
     int searched_count = 0;
+    int searched_quiet_count = 0;
+    std::vector<Move> searched_quiet_moves;
 
     for (const ScoredMove& scored : ordered) {
         const Move m = scored.move;
         const bool is_tactical = is_tactical_move(board, m);
+
+        // Late-move pruning is limited to low-history quiets at shallow,
+        // non-PV nodes outside check.
+        if (!is_pv && !in_check && depth <= 3 && !is_tactical &&
+            searched_quiet_count >= 6 + depth * 3 && quiet_history_score(m) <= 0) {
+            ++g_threshold_cutoffs;
+            ++g_late_move_prunes;
+            continue;
+        }
 
         // === Futility Pruning ===
         // Skip quiet moves that cannot plausibly raise alpha even with a full
@@ -437,6 +473,10 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
 
         board.undo_move(m);
         ++searched_count;
+        if (!is_tactical) {
+            ++searched_quiet_count;
+            searched_quiet_moves.push_back(m);
+        }
 
         if (g_stop.load(std::memory_order_relaxed)) break;
 
@@ -459,7 +499,9 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             ++g_beta_cutoffs;
             if (!is_tactical) {
                 record_killer(ply, m);
-                record_history(m, depth);
+                for (Move quiet : searched_quiet_moves)
+                    if (quiet != m) update_history(quiet, depth, false);
+                update_history(m, depth, true);
             }
             break;
         }
@@ -497,7 +539,7 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
 
     if (TTEntry* entry = tt_probe(board.hash())) {
         hash_move = entry->best_move;
-        if (entry->depth >= 0) {
+        if (entry->generation == g_tt_generation && entry->depth >= 0) {
             const int tt_score = tt_probe_score(entry->score, ply);
             if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
             if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
@@ -521,6 +563,9 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
     MoveList legal_moves;
     generate_legal_moves(board, legal_moves);
     if (legal_moves.empty()) return in_check ? -(MATE_VALUE - ply) : clamp_eval_score(stand_pat);
+    if (hash_move != MOVE_NONE &&
+        std::find(legal_moves.begin(), legal_moves.end(), hash_move) == legal_moves.end())
+        hash_move = MOVE_NONE;
 
     auto ordered = order_moves(board, legal_moves, ply, hash_move, !in_check);
     if (ordered.empty()) return clamp_eval_score(stand_pat);
@@ -599,7 +644,11 @@ SearchStats last_search_stats() {
         g_threshold_cutoffs,
         g_tt_probes,
         g_tt_hits,
-        g_tt_cutoffs
+        g_tt_cutoffs,
+        g_null_move_verifications,
+        g_late_move_prunes,
+        g_aspiration_fail_low,
+        g_aspiration_fail_high
     };
 }
 
@@ -611,6 +660,7 @@ Move iterative_deepening(Board& board, int allotted_ms, const std::function<void
     if (root_moves.empty()) return MOVE_NONE;
 
     Move best_move = root_moves.moves_[0];
+    int previous_score = 0;
     for (int depth = 1; depth <= MAX_DEPTH; ++depth) {
         if (time_up(allotted_ms)) break;
 
@@ -619,49 +669,73 @@ Move iterative_deepening(Board& board, int allotted_ms, const std::function<void
         if (moves.empty()) break;
 
         auto ordered = order_moves(board, moves, 0, best_move, false);
-        int alpha = -INF;
-        const int beta = INF;
+        int window = depth == 1 ? INF : 50;
         int current_score = -INF;
         Move current_best = MOVE_NONE;
-        int searched_count = 0;
 
-        for (const ScoredMove& scored : ordered) {
-            const Move m = scored.move;
-            if (time_up(allotted_ms)) {
-                g_stop.store(true, std::memory_order_relaxed);
-                break;
-            }
+        while (!g_stop.load(std::memory_order_relaxed)) {
+            const int alpha_start = std::max(-INF, previous_score - window);
+            const int beta = std::min(INF, previous_score + window);
+            int alpha = alpha_start;
+            current_score = -INF;
+            current_best = MOVE_NONE;
+            int searched_count = 0;
+            g_pv_len[0] = 0;
 
-            board.do_move(m);
-            int score;
-            if (searched_count == 0) {
-                score = -search(board, depth - 1, -beta, -alpha, 1);
-            } else {
-                score = -search(board, depth - 1, -alpha - 1, -alpha, 1);
-                if (!g_stop.load(std::memory_order_relaxed) &&
-                    score > alpha && score < beta) {
-                    score = -search(board, depth - 1, -beta, -alpha, 1);
+            for (const ScoredMove& scored : ordered) {
+                const Move m = scored.move;
+                if (time_up(allotted_ms)) {
+                    g_stop.store(true, std::memory_order_relaxed);
+                    break;
                 }
-            }
-            board.undo_move(m);
-            ++searched_count;
 
-            if (g_stop.load(std::memory_order_relaxed)) break;
+                board.do_move(m);
+                int score;
+                if (searched_count == 0) {
+                    score = -search(board, depth - 1, -beta, -alpha, 1);
+                } else {
+                    score = -search(board, depth - 1, -alpha - 1, -alpha, 1);
+                    if (!g_stop.load(std::memory_order_relaxed) &&
+                        score > alpha && score < beta) {
+                        score = -search(board, depth - 1, -beta, -alpha, 1);
+                    }
+                }
+                board.undo_move(m);
+                ++searched_count;
 
-            if (score > current_score) {
-                current_score = score;
-                current_best = m;
-                g_pv[0][0] = m;
-                for (int i = 1; i < g_pv_len[1]; ++i) g_pv[0][i] = g_pv[1][i];
-                g_pv_len[0] = g_pv_len[1];
+                if (g_stop.load(std::memory_order_relaxed)) break;
+
+                if (score > current_score) {
+                    current_score = score;
+                    current_best = m;
+                    g_pv[0][0] = m;
+                    for (int i = 1; i < g_pv_len[1]; ++i) g_pv[0][i] = g_pv[1][i];
+                    g_pv_len[0] = g_pv_len[1];
+                }
+                alpha = std::max(alpha, current_score);
+                if (alpha >= beta) break;
             }
-            alpha = std::max(alpha, current_score);
+
+            if (g_stop.load(std::memory_order_relaxed) || current_best == MOVE_NONE)
+                break;
+            if (current_score <= alpha_start && window < INF) {
+                ++g_aspiration_fail_low;
+                window = std::min(INF, window * 2);
+                continue;
+            }
+            if (current_score >= beta && window < INF) {
+                ++g_aspiration_fail_high;
+                window = std::min(INF, window * 2);
+                continue;
+            }
+            break;
         }
 
-        if (!g_stop.load(std::memory_order_relaxed) && current_best != MOVE_NONE) best_move = current_best;
+        if (g_stop.load(std::memory_order_relaxed) || current_best == MOVE_NONE) break;
+        best_move = current_best;
+        previous_score = current_score;
 
-        if (!g_stop.load(std::memory_order_relaxed) &&
-            info_cb && current_best != MOVE_NONE) {
+        if (info_cb) {
             SearchInfo info;
             info.depth = depth;
             info.seldepth = std::max(depth, g_seldepth);
