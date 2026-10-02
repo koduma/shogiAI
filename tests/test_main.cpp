@@ -744,6 +744,34 @@ static void test_lmr_preserves_tactical_best_move() {
 }
 
 // ============================================================
+// Test: TT-backed singular extensions run an exclusion search
+// and preserve the caller's position state.
+// ============================================================
+static void test_singular_extension_exclusion_search() {
+    Board b;
+    CHECK(b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b R 1"));
+    const std::string initial_sfen = b.to_sfen();
+    const uint64_t initial_hash = b.hash();
+    const size_t initial_history_size = b.history_.size();
+    const size_t initial_hash_history_size = b.pos_hashes_.size();
+
+    const Move best = iterative_deepening(b, 30000, [](const SearchInfo& info) {
+        if (info.depth >= 8) g_stop.store(true, std::memory_order_relaxed);
+    });
+    const SearchStats stats = last_search_stats();
+
+    CHECK(best != MOVE_NONE);
+    CHECK(stats.singular_tt_candidates > 0);
+    CHECK(stats.singular_extension_attempts > 0);
+    CHECK(stats.singular_extensions > 0);
+    CHECK_EQ(stats.exclusion_searches, stats.singular_extension_attempts);
+    CHECK_EQ(b.to_sfen(), initial_sfen);
+    CHECK_EQ(b.hash(), initial_hash);
+    CHECK_EQ(b.history_.size(), initial_history_size);
+    CHECK_EQ(b.pos_hashes_.size(), initial_hash_history_size);
+}
+
+// ============================================================
 // Test: alpha-beta clamps the returned score to -1000 once a node's
 // evaluated value drops to -1000 or below.
 //
@@ -1232,6 +1260,7 @@ int main() {
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();
     test_lmr_preserves_tactical_best_move();
+    test_singular_extension_exclusion_search();
     test_alpha_beta_clamps_large_deficit_to_minus_1000();
     test_alpha_beta_clamp_side_agnostic();
 

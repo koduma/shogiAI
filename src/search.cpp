@@ -62,6 +62,7 @@ uint64_t g_repetition_sensitive_tt_skips = 0;
 uint64_t g_checking_move_selectivity_skips = 0;
 uint64_t g_continuation_history_updates = 0;
 uint64_t g_continuation_history_ordering_uses = 0;
+uint64_t g_singular_tt_candidates = 0;
 uint64_t g_singular_extension_attempts = 0;
 uint64_t g_singular_extensions = 0;
 uint64_t g_exclusion_searches = 0;
@@ -213,6 +214,7 @@ void reset_search_state(int allotted_ms) {
     g_checking_move_selectivity_skips = 0;
     g_continuation_history_updates = 0;
     g_continuation_history_ordering_uses = 0;
+    g_singular_tt_candidates = 0;
     g_singular_extension_attempts = 0;
     g_singular_extensions = 0;
     g_exclusion_searches = 0;
@@ -377,6 +379,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             if (!repetition_sensitive && !is_pv && !in_check && depth >= 6 &&
                 entry->generation == g_tt_generation && entry->depth >= depth - 3 &&
                 singular_bound && entry->best_move != MOVE_NONE) {
+                ++g_singular_tt_candidates;
                 singular_tt_score = tt_probe_score(entry->score, ply);
                 try_singular_extension = !is_mate_score(singular_tt_score) &&
                     singular_tt_score >= beta - 2 * depth;
@@ -413,7 +416,8 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // Skip our turn and see if the opponent can still stay below beta.
     // Safe conditions: not PV, not in check, no consecutive null moves,
     // depth >= 3, not a potential zugzwang (we have non-king/pawn material).
-    if (excluded_move == MOVE_NONE && !repetition_sensitive && !is_pv && !in_check && !no_null && depth >= 3) {
+    if (excluded_move == MOVE_NONE && !try_singular_extension &&
+        !repetition_sensitive && !is_pv && !in_check && !no_null && depth >= 3) {
         // Quick material check to avoid null move in zugzwang-prone positions
         bool has_major = false;
         const Color us = board.side_to_move();
@@ -478,7 +482,6 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     if (hash_move != MOVE_NONE &&
         std::find(legal_moves.begin(), legal_moves.end(), hash_move) == legal_moves.end())
         hash_move = MOVE_NONE;
-
     if (excluded_move != MOVE_NONE) {
         const auto excluded = std::find(legal_moves.begin(), legal_moves.end(), excluded_move);
         if (excluded != legal_moves.end() && legal_moves.size() == 1) return -INF;
@@ -796,6 +799,7 @@ SearchStats last_search_stats() {
         g_checking_move_selectivity_skips,
         g_continuation_history_updates,
         g_continuation_history_ordering_uses,
+        g_singular_tt_candidates,
         g_singular_extension_attempts,
         g_singular_extensions,
         g_exclusion_searches
