@@ -625,6 +625,16 @@ static void test_late_move_pruning() {
 }
 
 // ============================================================
+// Test: quiet refutations are reused as countermoves and avoid LMR.
+// ============================================================
+static void test_countermove_ordering() {
+    Board b;
+    b.set_startpos();
+    (void)negamax(b, 5, -INF, INF, 0);
+    CHECK(last_search_stats().countermove_hits > 0);
+}
+
+// ============================================================
 // Test: NMP does NOT prune when the side to move is in check
 // (verifies the in_check safety condition).
 // ============================================================
@@ -1161,6 +1171,7 @@ int main() {
     test_search_info_uses_completed_iteration();
     test_null_move_pruning_fires();
     test_late_move_pruning();
+    test_countermove_ordering();
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();
     test_lmr_preserves_tactical_best_move();
