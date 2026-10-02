@@ -449,12 +449,15 @@ int Board::repetition_count() const {
     return cnt;
 }
 
-RepetitionResult Board::repetition_result() const {
+RepetitionResult Board::repetition_result(bool* repetition_sensitive) const {
+    if (repetition_sensitive) *repetition_sensitive = false;
     size_t occurrences[4] = {};
     size_t count = 0;
     for (size_t i = pos_hashes_.size(); i > 0 && count < 4; --i) {
-        if (pos_hashes_[i - 1] == hash_)
+        if (pos_hashes_[i - 1] == hash_) {
+            if (repetition_sensitive && count > 0) *repetition_sensitive = true;
             occurrences[3 - count++] = i - 1;
+        }
     }
     if (count < 4)
         return RepetitionResult::NONE;

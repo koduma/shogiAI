@@ -62,7 +62,7 @@ public:
 
     // Repetition
     int  repetition_count() const;
-    RepetitionResult repetition_result() const;
+    RepetitionResult repetition_result(bool* repetition_sensitive = nullptr) const;
 
     // Debug
     void print() const;

@@ -58,6 +58,8 @@ uint64_t g_late_move_prunes  = 0;
 uint64_t g_aspiration_fail_low = 0;
 uint64_t g_aspiration_fail_high = 0;
 uint64_t g_countermove_hits = 0;
+uint64_t g_repetition_sensitive_tt_skips = 0;
+uint64_t g_checking_move_selectivity_skips = 0;
 int      g_seldepth          = 0;
 
 std::array<std::array<Move, MAX_DEPTH>, MAX_DEPTH> g_pv{};
@@ -201,6 +203,8 @@ void reset_search_state(int allotted_ms) {
     g_aspiration_fail_low = 0;
     g_aspiration_fail_high = 0;
     g_countermove_hits = 0;
+    g_repetition_sensitive_tt_skips = 0;
+    g_checking_move_selectivity_skips = 0;
     g_seldepth = 0;
     g_pv_len.fill(0);
     for (auto& killers : g_killers) killers = {MOVE_NONE, MOVE_NONE};
@@ -313,7 +317,8 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     g_seldepth = std::max(g_seldepth, ply);
     if (ply < MAX_DEPTH) g_pv_len[ply] = ply;
 
-    const RepetitionResult repetition = board.repetition_result();
+    bool repetition_sensitive = false;
+    const RepetitionResult repetition = board.repetition_result(&repetition_sensitive);
     if (repetition == RepetitionResult::DRAW) return 0;
     if (repetition == RepetitionResult::SIDE_TO_MOVE_WINS) return MATE_VALUE - ply;
     if (repetition == RepetitionResult::SIDE_TO_MOVE_LOSES) return -(MATE_VALUE - ply);
@@ -330,13 +335,17 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     if (TTEntry* entry = tt_probe(board.hash())) {
         hash_move = entry->best_move;
         if (entry->generation == g_tt_generation && entry->depth >= depth) {
-            const int tt_score = tt_probe_score(entry->score, ply);
-            if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
-            if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
-            else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
-            if (alpha >= beta) {
-                ++g_tt_cutoffs;
-                return clamp_eval_score(tt_score);
+            if (repetition_sensitive) {
+                ++g_repetition_sensitive_tt_skips;
+            } else {
+                const int tt_score = tt_probe_score(entry->score, ply);
+                if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
+                if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
+                else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
+                if (alpha >= beta) {
+                    ++g_tt_cutoffs;
+                    return clamp_eval_score(tt_score);
+                }
             }
         }
     }
@@ -344,7 +353,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // === Reverse Futility Pruning (static null-move pruning) ===
     // If the static evaluation exceeds beta by a depth-scaled margin, the
     // position is likely so good that we can safely return a lower bound.
-    if (!is_pv && !in_check && depth <= 3) {
+    if (!repetition_sensitive && !is_pv && !in_check && depth <= 3) {
         const int rfp_margin = 200 * depth;
         const int static_eval = evaluate(board);
         if (static_eval - rfp_margin >= beta)
@@ -355,7 +364,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // Skip our turn and see if the opponent can still stay below beta.
     // Safe conditions: not PV, not in check, no consecutive null moves,
     // depth >= 3, not a potential zugzwang (we have non-king/pawn material).
-    if (!is_pv && !in_check && !no_null && depth >= 3) {
+    if (!repetition_sensitive && !is_pv && !in_check && !no_null && depth >= 3) {
         // Quick material check to avoid null move in zugzwang-prone positions
         bool has_major = false;
         const Color us = board.side_to_move();
@@ -422,7 +431,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
         hash_move = MOVE_NONE;
 
     // Pre-compute static eval for futility pruning (only at shallow non-PV nodes).
-    const bool use_futility = (!is_pv && !in_check && depth <= 2);
+    const bool use_futility = (!repetition_sensitive && !is_pv && !in_check && depth <= 2);
     const int  futility_eval = use_futility ? evaluate(board) : -INF;
 
     auto ordered = order_moves(board, legal_moves, ply, hash_move, false, previous_move);
@@ -435,14 +444,23 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     for (const ScoredMove& scored : ordered) {
         const Move m = scored.move;
         const bool is_tactical = is_tactical_move(board, m);
+        board.do_move(m);
+        const bool gives_check = board.history_.back().gave_check;
 
         // Late-move pruning is limited to low-history quiets at shallow,
-        // non-PV nodes outside check.
-        if (!is_pv && !in_check && depth <= 3 && !is_tactical &&
-            searched_quiet_count >= 6 + depth * 3 && quiet_history_score(m) <= 0) {
-            ++g_threshold_cutoffs;
-            ++g_late_move_prunes;
-            continue;
+        // non-PV nodes outside check. Checking moves remain forcing moves.
+        const bool lmp_candidate = !repetition_sensitive && !is_pv && !in_check &&
+            depth <= 3 && !is_tactical && searched_quiet_count >= 6 + depth * 3 &&
+            quiet_history_score(m) <= 0;
+        if (lmp_candidate) {
+            if (gives_check) {
+                ++g_checking_move_selectivity_skips;
+            } else {
+                board.undo_move(m);
+                ++g_threshold_cutoffs;
+                ++g_late_move_prunes;
+                continue;
+            }
         }
 
         // === Futility Pruning ===
@@ -450,12 +468,15 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
         // piece gain at this shallow depth.
         if (use_futility && searched_count >= 1 && !is_tactical) {
             if (futility_eval + 300 * depth < alpha) {
-                ++g_threshold_cutoffs;
-                continue;
+                if (gives_check) {
+                    ++g_checking_move_selectivity_skips;
+                } else {
+                    board.undo_move(m);
+                    ++g_threshold_cutoffs;
+                    continue;
+                }
             }
         }
-
-        board.do_move(m);
 
         int score;
         if (searched_count == 0) {
@@ -467,7 +488,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             // countermoves retain their full depth.
             int lmr_depth = depth - 1;
             bool did_lmr  = false;
-            if (!in_check && depth >= 3 && searched_count >= 2 &&
+            if (!repetition_sensitive && !in_check && depth >= 3 && searched_count >= 2 &&
                 !is_tactical && m != hash_move &&
                 searched_count < MAX_DEPTH && depth < MAX_DEPTH) {
                 const int reduction = lmr_table[depth][searched_count];
@@ -480,8 +501,12 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
                 if (history > 4096) --adjusted_reduction;
                 else if (history < -4096) ++adjusted_reduction;
                 if (adjusted_reduction > 0 && !is_killer && !is_countermove) {
-                    lmr_depth = std::max(1, depth - 1 - std::min(adjusted_reduction, depth - 2));
-                    did_lmr   = true;
+                    if (gives_check) {
+                        ++g_checking_move_selectivity_skips;
+                    } else {
+                        lmr_depth = std::max(1, depth - 1 - std::min(adjusted_reduction, depth - 2));
+                        did_lmr   = true;
+                    }
                 }
             }
 
@@ -561,7 +586,8 @@ int quiescence(Board& board, int alpha, int beta, int ply, Move previous_move) {
     g_seldepth = std::max(g_seldepth, ply);
     if (ply < MAX_DEPTH) g_pv_len[ply] = ply;
 
-    const RepetitionResult repetition = board.repetition_result();
+    bool repetition_sensitive = false;
+    const RepetitionResult repetition = board.repetition_result(&repetition_sensitive);
     if (repetition == RepetitionResult::DRAW) return 0;
     if (repetition == RepetitionResult::SIDE_TO_MOVE_WINS) return MATE_VALUE - ply;
     if (repetition == RepetitionResult::SIDE_TO_MOVE_LOSES) return -(MATE_VALUE - ply);
@@ -574,13 +600,17 @@ int quiescence(Board& board, int alpha, int beta, int ply, Move previous_move) {
     if (TTEntry* entry = tt_probe(board.hash())) {
         hash_move = entry->best_move;
         if (entry->generation == g_tt_generation && entry->depth >= 0) {
-            const int tt_score = tt_probe_score(entry->score, ply);
-            if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
-            if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
-            else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
-            if (alpha >= beta) {
-                ++g_tt_cutoffs;
-                return clamp_eval_score(tt_score);
+            if (repetition_sensitive) {
+                ++g_repetition_sensitive_tt_skips;
+            } else {
+                const int tt_score = tt_probe_score(entry->score, ply);
+                if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
+                if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
+                else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
+                if (alpha >= beta) {
+                    ++g_tt_cutoffs;
+                    return clamp_eval_score(tt_score);
+                }
             }
         }
     }
@@ -683,7 +713,9 @@ SearchStats last_search_stats() {
         g_late_move_prunes,
         g_aspiration_fail_low,
         g_aspiration_fail_high,
-        g_countermove_hits
+        g_countermove_hits,
+        g_repetition_sensitive_tt_skips,
+        g_checking_move_selectivity_skips
     };
 }
 
