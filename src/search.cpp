@@ -62,6 +62,10 @@ uint64_t g_repetition_sensitive_tt_skips = 0;
 uint64_t g_checking_move_selectivity_skips = 0;
 uint64_t g_continuation_history_updates = 0;
 uint64_t g_continuation_history_ordering_uses = 0;
+uint64_t g_singular_tt_candidates = 0;
+uint64_t g_singular_extension_attempts = 0;
+uint64_t g_singular_extensions = 0;
+uint64_t g_exclusion_searches = 0;
 int      g_seldepth          = 0;
 
 std::array<std::array<Move, MAX_DEPTH>, MAX_DEPTH> g_pv{};
@@ -210,6 +214,10 @@ void reset_search_state(int allotted_ms) {
     g_checking_move_selectivity_skips = 0;
     g_continuation_history_updates = 0;
     g_continuation_history_ordering_uses = 0;
+    g_singular_tt_candidates = 0;
+    g_singular_extension_attempts = 0;
+    g_singular_extensions = 0;
+    g_exclusion_searches = 0;
     g_seldepth = 0;
     g_pv_len.fill(0);
     for (auto& killers : g_killers) killers = {MOVE_NONE, MOVE_NONE};
@@ -337,7 +345,7 @@ int quiescence(Board& board, int alpha, int beta, int ply, Move previous_move);
 
 // no_null: true when the previous move was a null move (prevents consecutive null moves).
 int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null = false,
-           Move previous_move = MOVE_NONE) {
+           Move previous_move = MOVE_NONE, Move excluded_move = MOVE_NONE) {
     if (((++g_nodes) & TIME_CHECK_MASK) == 0) {
         if (time_up(g_allotted_ms)) g_stop.store(true, std::memory_order_relaxed);
     }
@@ -360,20 +368,35 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // PV node: window is wider than a null window.
     const bool is_pv = (beta > alpha + 1);
     Move hash_move = MOVE_NONE;
+    bool try_singular_extension = false;
+    int singular_tt_score = 0;
 
-    if (TTEntry* entry = tt_probe(board.hash())) {
-        hash_move = entry->best_move;
-        if (entry->generation == g_tt_generation && entry->depth >= depth) {
-            if (repetition_sensitive) {
-                ++g_repetition_sensitive_tt_skips;
-            } else {
-                const int tt_score = tt_probe_score(entry->score, ply);
-                if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
-                if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
-                else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
-                if (alpha >= beta) {
-                    ++g_tt_cutoffs;
-                    return clamp_eval_score(tt_score);
+    if (excluded_move == MOVE_NONE) {
+        if (TTEntry* entry = tt_probe(board.hash())) {
+            hash_move = entry->best_move;
+            const bool singular_bound = entry->bound == BOUND_LOWER ||
+                entry->bound == BOUND_EXACT;
+            if (!repetition_sensitive && !is_pv && !in_check && depth >= 6 &&
+                entry->generation == g_tt_generation && entry->depth >= depth - 3 &&
+                singular_bound && entry->best_move != MOVE_NONE) {
+                ++g_singular_tt_candidates;
+                singular_tt_score = tt_probe_score(entry->score, ply);
+                try_singular_extension = !is_mate_score(singular_tt_score) &&
+                    singular_tt_score >= beta - 2 * depth;
+            }
+            if (entry->generation == g_tt_generation && entry->depth >= depth &&
+                !try_singular_extension) {
+                if (repetition_sensitive) {
+                    ++g_repetition_sensitive_tt_skips;
+                } else {
+                    const int tt_score = tt_probe_score(entry->score, ply);
+                    if (entry->bound == BOUND_EXACT) return clamp_eval_score(tt_score);
+                    if (entry->bound == BOUND_LOWER) alpha = std::max(alpha, tt_score);
+                    else if (entry->bound == BOUND_UPPER) beta = std::min(beta, tt_score);
+                    if (alpha >= beta) {
+                        ++g_tt_cutoffs;
+                        return clamp_eval_score(tt_score);
+                    }
                 }
             }
         }
@@ -382,7 +405,7 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // === Reverse Futility Pruning (static null-move pruning) ===
     // If the static evaluation exceeds beta by a depth-scaled margin, the
     // position is likely so good that we can safely return a lower bound.
-    if (!repetition_sensitive && !is_pv && !in_check && depth <= 3) {
+    if (excluded_move == MOVE_NONE && !repetition_sensitive && !is_pv && !in_check && depth <= 3) {
         const int rfp_margin = 200 * depth;
         const int static_eval = evaluate(board);
         if (static_eval - rfp_margin >= beta)
@@ -393,7 +416,8 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     // Skip our turn and see if the opponent can still stay below beta.
     // Safe conditions: not PV, not in check, no consecutive null moves,
     // depth >= 3, not a potential zugzwang (we have non-king/pawn material).
-    if (!repetition_sensitive && !is_pv && !in_check && !no_null && depth >= 3) {
+    if (excluded_move == MOVE_NONE && !try_singular_extension &&
+        !repetition_sensitive && !is_pv && !in_check && !no_null && depth >= 3) {
         // Quick material check to avoid null move in zugzwang-prone positions
         bool has_major = false;
         const Color us = board.side_to_move();
@@ -458,9 +482,29 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     if (hash_move != MOVE_NONE &&
         std::find(legal_moves.begin(), legal_moves.end(), hash_move) == legal_moves.end())
         hash_move = MOVE_NONE;
+    if (excluded_move != MOVE_NONE) {
+        const auto excluded = std::find(legal_moves.begin(), legal_moves.end(), excluded_move);
+        if (excluded != legal_moves.end() && legal_moves.size() == 1) return -INF;
+    }
+
+    int singular_extension = 0;
+    if (try_singular_extension && hash_move != MOVE_NONE) {
+        ++g_singular_extension_attempts;
+        const int singular_beta = singular_tt_score - 2 * depth;
+        ++g_exclusion_searches;
+        const int alternative_score = search(
+            board, std::max(1, depth / 2), singular_beta - 1, singular_beta,
+            ply, true, previous_move, hash_move);
+        if (g_stop.load(std::memory_order_relaxed)) return 0;
+        if (alternative_score < singular_beta) {
+            singular_extension = 1;
+            ++g_singular_extensions;
+        }
+    }
 
     // Pre-compute static eval for futility pruning (only at shallow non-PV nodes).
-    const bool use_futility = (!repetition_sensitive && !is_pv && !in_check && depth <= 2);
+    const bool use_futility = (excluded_move == MOVE_NONE && !repetition_sensitive &&
+        !is_pv && !in_check && depth <= 2);
     const int  futility_eval = use_futility ? evaluate(board) : -INF;
 
     auto ordered = order_moves(board, legal_moves, ply, hash_move, false, previous_move);
@@ -472,13 +516,14 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
 
     for (const ScoredMove& scored : ordered) {
         const Move m = scored.move;
+        if (m == excluded_move) continue;
         const bool is_tactical = is_tactical_move(board, m);
         board.do_move(m);
         const bool gives_check = board.history_.back().gave_check;
 
         // Late-move pruning is limited to low-history quiets at shallow,
         // non-PV nodes outside check. Checking moves remain forcing moves.
-        const bool lmp_candidate = !repetition_sensitive && !is_pv && !in_check &&
+        const bool lmp_candidate = excluded_move == MOVE_NONE && !repetition_sensitive && !is_pv && !in_check &&
             depth <= 3 && !is_tactical && searched_quiet_count >= 6 + depth * 3 &&
             quiet_history_score(m) <= 0;
         if (lmp_candidate) {
@@ -508,17 +553,18 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
         }
 
         int score;
+        const int move_depth = depth - 1 + (m == hash_move ? singular_extension : 0);
         if (searched_count == 0) {
             // First move: always search with the full window.
-            score = -search(board, depth - 1, -beta, -alpha, ply + 1, false, m);
+            score = -search(board, move_depth, -beta, -alpha, ply + 1, false, m);
         } else {
             // === LMR (Late Move Reductions) ===
             // Reduce late quiet moves less when history is strong; killer and
             // countermoves retain their full depth.
-            int lmr_depth = depth - 1;
+            int lmr_depth = move_depth;
             bool did_lmr  = false;
-            if (!repetition_sensitive && !in_check && depth >= 3 && searched_count >= 2 &&
-                !is_tactical && m != hash_move &&
+            if (excluded_move == MOVE_NONE && !repetition_sensitive && !in_check &&
+                depth >= 3 && searched_count >= 2 && !is_tactical && m != hash_move &&
                 searched_count < MAX_DEPTH && depth < MAX_DEPTH) {
                 const int reduction = lmr_table[depth][searched_count];
                 const bool is_killer = ply < MAX_DEPTH &&
@@ -547,14 +593,14 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
             // If LMR raised alpha at reduced depth, re-search at full depth
             // with null window to confirm.
             if (!g_stop.load(std::memory_order_relaxed) && did_lmr && score > alpha) {
-                score = -search(board, depth - 1, -alpha - 1, -alpha, ply + 1, false, m);
+                score = -search(board, move_depth, -alpha - 1, -alpha, ply + 1, false, m);
                 did_lmr = false;
             }
 
             // If PVS null window failed high, this looks like a new best move;
             // re-search with the full window to get the exact score.
             if (!g_stop.load(std::memory_order_relaxed) && score > alpha && score < beta) {
-                score = -search(board, depth - 1, -beta, -alpha, ply + 1, false, m);
+                score = -search(board, move_depth, -beta, -alpha, ply + 1, false, m);
             }
         }
 
@@ -606,7 +652,8 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
     BoundType bound = BOUND_EXACT;
     if (best_score <= original_alpha) bound = BOUND_UPPER;
     else if (best_score >= original_beta) bound = BOUND_LOWER;
-    tt_store(board.hash(), depth, best_score, bound, best_move, ply);
+    if (excluded_move == MOVE_NONE)
+        tt_store(board.hash(), depth, best_score, bound, best_move, ply);
     return clamp_eval_score(best_score);
 }
 
@@ -751,7 +798,11 @@ SearchStats last_search_stats() {
         g_repetition_sensitive_tt_skips,
         g_checking_move_selectivity_skips,
         g_continuation_history_updates,
-        g_continuation_history_ordering_uses
+        g_continuation_history_ordering_uses,
+        g_singular_tt_candidates,
+        g_singular_extension_attempts,
+        g_singular_extensions,
+        g_exclusion_searches
     };
 }
 
