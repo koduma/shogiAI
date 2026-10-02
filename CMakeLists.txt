@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 project(ShogiEngine CXX)
+find_package(Threads REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +28,7 @@ target_compile_definitions(shogi_core PRIVATE SHOGIAI_SOURCE_DIR="${CMAKE_SOURCE
 
 # ---- USI engine executable ----
 add_executable(shogi_engine src/main.cpp)
-target_link_libraries(shogi_engine PRIVATE shogi_core)
+target_link_libraries(shogi_engine PRIVATE shogi_core Threads::Threads)
 
 # ---- Tests ----
 add_executable(shogi_tests tests/test_main.cpp)

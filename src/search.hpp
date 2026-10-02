@@ -53,7 +53,9 @@ int compute_allotted_ms(int my_time_ms, int byoyomi_ms);
 
 // Iterative-deepening entry point.
 // Returns the best move found within allotted_ms milliseconds.
-Move iterative_deepening(Board& board, int allotted_ms, const std::function<void(const SearchInfo&)>& info_cb = {});
+Move iterative_deepening(Board& board, int allotted_ms,
+                         const std::function<void(const SearchInfo&)>& info_cb = {},
+                         const std::function<void()>& started_cb = {});
 
 // Single-depth negamax alpha-beta (exposed for testing)
 int negamax(Board& board, int depth, int alpha, int beta, int ply);

@@ -687,8 +687,11 @@ SearchStats last_search_stats() {
     };
 }
 
-Move iterative_deepening(Board& board, int allotted_ms, const std::function<void(const SearchInfo&)>& info_cb) {
+Move iterative_deepening(Board& board, int allotted_ms,
+                         const std::function<void(const SearchInfo&)>& info_cb,
+                         const std::function<void()>& started_cb) {
     reset_search_state(allotted_ms);
+    if (started_cb) started_cb();
 
     MoveList root_moves;
     generate_legal_moves(board, root_moves);

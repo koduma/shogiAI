@@ -6,6 +6,9 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <future>
+#include <thread>
+#include <utility>
 
 // ============================================================
 // USI main loop
@@ -18,6 +21,7 @@ int main() {
 
     Board board;
     board.set_startpos();
+    std::thread search_thread;
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -27,6 +31,11 @@ int main() {
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
+
+        if (search_thread.joinable() && cmd != "stop") {
+            g_stop.store(true);
+            search_thread.join();
+        }
 
         // ---- usi ----
         if (cmd == "usi") {
@@ -137,36 +146,49 @@ int main() {
             std::cout << "info string " << eval_status_message() << "\n";
             std::cout.flush();
 
-            Move best = iterative_deepening(board, allotted_ms, [](const SearchInfo& info) {
-                std::cout << "info depth " << info.depth
-                          << " seldepth " << info.seldepth
-                          << " time " << info.time_ms
-                          << " nodes " << info.nodes
-                          << " nps " << info.nps << " score ";
-                if (info.score_is_mate) std::cout << "mate " << info.score_mate;
-                else                    std::cout << "cp " << info.score_cp;
-                std::cout << " pv";
-                for (Move m : info.pv) std::cout << ' ' << move_to_usi(m);
-                std::cout << "\n";
+            Board search_board = board;
+            std::promise<void> started;
+            std::future<void> search_started = started.get_future();
+            search_thread = std::thread([search_board = std::move(search_board), allotted_ms,
+                                         started = std::move(started)]() mutable {
+                Move best = iterative_deepening(search_board, allotted_ms, [](const SearchInfo& info) {
+                    std::cout << "info depth " << info.depth
+                              << " seldepth " << info.seldepth
+                              << " time " << info.time_ms
+                              << " nodes " << info.nodes
+                              << " nps " << info.nps << " score ";
+                    if (info.score_is_mate) std::cout << "mate " << info.score_mate;
+                    else                    std::cout << "cp " << info.score_cp;
+                    std::cout << " pv";
+                    for (Move m : info.pv) std::cout << ' ' << move_to_usi(m);
+                    std::cout << "\n";
+                    std::cout.flush();
+                }, [&started] { started.set_value(); });
+
+                if (best == MOVE_NONE) {
+                    std::cout << "bestmove resign\n";
+                } else {
+                    std::cout << "bestmove " << move_to_usi(best) << "\n";
+                }
                 std::cout.flush();
             });
-
-            if (best == MOVE_NONE) {
-                std::cout << "bestmove resign\n";
-            } else {
-                std::cout << "bestmove " << move_to_usi(best) << "\n";
-            }
-            std::cout.flush();
+            search_started.wait();
 
         // ---- stop ----
         } else if (cmd == "stop") {
             g_stop.store(true);
+            if (search_thread.joinable()) search_thread.join();
 
         // ---- quit ----
         } else if (cmd == "quit") {
             break;
         }
         // Ignore unknown commands (USI spec says to ignore them)
+    }
+
+    if (search_thread.joinable()) {
+        g_stop.store(true);
+        search_thread.join();
     }
 
     return 0;
