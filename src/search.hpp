@@ -36,6 +36,7 @@ struct SearchStats {
     uint64_t late_move_prunes = 0;
     uint64_t aspiration_fail_low = 0;
     uint64_t aspiration_fail_high = 0;
+    uint64_t countermove_hits = 0;
 };
 
 // Start the clock for a search
