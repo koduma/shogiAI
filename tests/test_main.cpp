@@ -635,6 +635,36 @@ static void test_countermove_ordering() {
 }
 
 // ============================================================
+// Test: repeated positions do not use path-dependent TT scores.
+// ============================================================
+static void test_repetition_sensitive_tt_cutoff_is_skipped() {
+    Board original;
+    CHECK(original.parse_sfen("4k4/9/9/9/9/9/9/9/K8 w - 1"));
+    (void)negamax(original, 1, -INF, INF, 0);
+
+    Board repeated;
+    CHECK(repeated.parse_sfen("4k4/9/9/9/9/9/9/9/K8 w - 1"));
+    for (const char* usi : {"5a4a", "9i8i", "4a5a", "8i9i"})
+        repeated.do_move(usi_to_move(usi));
+    CHECK_EQ(repeated.hash(), original.hash());
+    CHECK_EQ(repeated.repetition_count(), 2);
+
+    (void)negamax(repeated, 1, -INF, INF, 1);
+    CHECK(last_search_stats().repetition_sensitive_tt_skips > 0);
+    CHECK_EQ(repeated.hash(), original.hash());
+}
+
+// ============================================================
+// Test: quiet checking moves bypass selective pruning/reduction.
+// ============================================================
+static void test_quiet_check_moves_bypass_selectivity() {
+    Board b;
+    CHECK(b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b R 1"));
+    (void)negamax(b, 3, INF - 1, INF, 0);
+    CHECK(last_search_stats().checking_move_selectivity_skips > 0);
+}
+
+// ============================================================
 // Test: NMP does NOT prune when the side to move is in check
 // (verifies the in_check safety condition).
 // ============================================================
@@ -1172,6 +1202,8 @@ int main() {
     test_null_move_pruning_fires();
     test_late_move_pruning();
     test_countermove_ordering();
+    test_repetition_sensitive_tt_cutoff_is_skipped();
+    test_quiet_check_moves_bypass_selectivity();
     test_null_move_skipped_in_check();
     test_depth_improved_with_pruning();
     test_lmr_preserves_tactical_best_move();
