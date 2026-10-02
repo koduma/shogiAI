@@ -39,6 +39,8 @@ struct SearchStats {
     uint64_t countermove_hits = 0;
     uint64_t repetition_sensitive_tt_skips = 0;
     uint64_t checking_move_selectivity_skips = 0;
+    uint64_t continuation_history_updates = 0;
+    uint64_t continuation_history_ordering_uses = 0;
 };
 
 // Start the clock for a search
