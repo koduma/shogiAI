@@ -60,6 +60,8 @@ uint64_t g_aspiration_fail_high = 0;
 uint64_t g_countermove_hits = 0;
 uint64_t g_repetition_sensitive_tt_skips = 0;
 uint64_t g_checking_move_selectivity_skips = 0;
+uint64_t g_continuation_history_updates = 0;
+uint64_t g_continuation_history_ordering_uses = 0;
 int      g_seldepth          = 0;
 
 std::array<std::array<Move, MAX_DEPTH>, MAX_DEPTH> g_pv{};
@@ -68,6 +70,7 @@ std::array<std::array<Move, 2>, MAX_DEPTH> g_killers{};
 std::array<std::array<int, SQUARE_NB>, SQUARE_NB> g_history{};
 std::array<std::array<int, SQUARE_NB>, PT_NB> g_drop_history{};
 std::array<Move, COUNTERMOVE_KEY_NB> g_countermoves{};
+std::array<std::array<int, COUNTERMOVE_KEY_NB>, SQUARE_NB> g_continuation_history{};
 std::array<TTEntry, TT_SIZE> g_tt{};
 uint16_t g_tt_generation = 1;
 
@@ -205,12 +208,15 @@ void reset_search_state(int allotted_ms) {
     g_countermove_hits = 0;
     g_repetition_sensitive_tt_skips = 0;
     g_checking_move_selectivity_skips = 0;
+    g_continuation_history_updates = 0;
+    g_continuation_history_ordering_uses = 0;
     g_seldepth = 0;
     g_pv_len.fill(0);
     for (auto& killers : g_killers) killers = {MOVE_NONE, MOVE_NONE};
     for (auto& hist : g_history) hist.fill(0);
     for (auto& hist : g_drop_history) hist.fill(0);
     g_countermoves.fill(MOVE_NONE);
+    for (auto& history : g_continuation_history) history.fill(0);
     next_tt_generation();
 }
 
@@ -235,6 +241,14 @@ inline int countermove_key(Move m) {
     return from_sq(m) * SQUARE_NB + to_sq(m);
 }
 
+inline int continuation_history_score(Move m, Move previous_move) {
+    const int previous_to = previous_move == MOVE_NONE ? -1 : to_sq(previous_move);
+    const int current_key = countermove_key(m);
+    if (previous_to < 0 || previous_to >= SQUARE_NB || current_key < 0)
+        return 0;
+    return g_continuation_history[previous_to][current_key];
+}
+
 void record_killer(int ply, Move m) {
     if (ply < 0 || ply >= MAX_DEPTH) return;
     if (g_killers[ply][0] == m) return;
@@ -253,6 +267,19 @@ void update_history(Move m, int depth, bool good) {
     }
     *value += bonus - (*value * std::abs(bonus)) / MAX_HISTORY;
     *value = std::clamp(*value, -MAX_HISTORY, MAX_HISTORY);
+}
+
+void update_continuation_history(Move previous_move, Move m, int depth, bool good) {
+    const int previous_to = previous_move == MOVE_NONE ? -1 : to_sq(previous_move);
+    const int current_key = countermove_key(m);
+    if (previous_to < 0 || previous_to >= SQUARE_NB || current_key < 0) return;
+
+    int bonus = std::min(2048, depth * depth + depth * 4);
+    if (!good) bonus = -bonus / 2;
+    int& value = g_continuation_history[previous_to][current_key];
+    value += bonus - (value * std::abs(bonus)) / MAX_HISTORY;
+    value = std::clamp(value, -MAX_HISTORY, MAX_HISTORY);
+    ++g_continuation_history_updates;
 }
 
 int capture_score(const Board& board, Move m) {
@@ -288,7 +315,9 @@ int move_score(const Board& board, Move m, int ply, Move hash_move, Move previou
         return KILLER_2_BONUS - 1;
     }
 
-    return quiet_history_score(m);
+    const int continuation = continuation_history_score(m, previous_move);
+    if (continuation != 0) ++g_continuation_history_ordering_uses;
+    return quiet_history_score(m) + continuation / 2;
 }
 
 std::vector<ScoredMove> order_moves(const Board& board, const MoveList& moves, int ply, Move hash_move, bool tactical_only, Move previous_move = MOVE_NONE) {
@@ -496,10 +525,11 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
                     (m == g_killers[ply][0] || m == g_killers[ply][1]);
                 const int previous_key = countermove_key(previous_move);
                 const bool is_countermove = previous_key >= 0 && g_countermoves[previous_key] == m;
-                int adjusted_reduction = reduction;
                 const int history = quiet_history_score(m);
-                if (history > 4096) --adjusted_reduction;
-                else if (history < -4096) ++adjusted_reduction;
+                const int continuation = continuation_history_score(m, previous_move);
+                const int adjusted_reduction = std::clamp(
+                    reduction - history / 8192 - continuation / 8192 - (is_pv ? 1 : 0),
+                    0, depth - 2);
                 if (adjusted_reduction > 0 && !is_killer && !is_countermove) {
                     if (gives_check) {
                         ++g_checking_move_selectivity_skips;
@@ -559,8 +589,12 @@ int search(Board& board, int depth, int alpha, int beta, int ply, bool no_null =
                 const int previous_key = countermove_key(previous_move);
                 if (previous_key >= 0) g_countermoves[previous_key] = m;
                 for (Move quiet : searched_quiet_moves)
-                    if (quiet != m) update_history(quiet, depth, false);
+                    if (quiet != m) {
+                        update_history(quiet, depth, false);
+                        update_continuation_history(previous_move, quiet, depth, false);
+                    }
                 update_history(m, depth, true);
+                update_continuation_history(previous_move, m, depth, true);
             }
             break;
         }
@@ -715,7 +749,9 @@ SearchStats last_search_stats() {
         g_aspiration_fail_high,
         g_countermove_hits,
         g_repetition_sensitive_tt_skips,
-        g_checking_move_selectivity_skips
+        g_checking_move_selectivity_skips,
+        g_continuation_history_updates,
+        g_continuation_history_ordering_uses
     };
 }
 

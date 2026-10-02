@@ -635,6 +635,30 @@ static void test_countermove_ordering() {
 }
 
 // ============================================================
+// Test: continuation history informs quiet ordering and search
+// leaves the caller's board state unchanged.
+// ============================================================
+static void test_continuation_history_and_board_restoration() {
+    Board b;
+    b.set_startpos();
+    const std::string initial_sfen = b.to_sfen();
+    const uint64_t initial_hash = b.hash();
+    const size_t initial_history_size = b.history_.size();
+    const size_t initial_hash_history_size = b.pos_hashes_.size();
+
+    const int score = negamax(b, 5, -INF, INF, 0);
+    const SearchStats stats = last_search_stats();
+
+    CHECK(score > -INF && score < INF);
+    CHECK(stats.continuation_history_updates > 0);
+    CHECK(stats.continuation_history_ordering_uses > 0);
+    CHECK_EQ(b.to_sfen(), initial_sfen);
+    CHECK_EQ(b.hash(), initial_hash);
+    CHECK_EQ(b.history_.size(), initial_history_size);
+    CHECK_EQ(b.pos_hashes_.size(), initial_hash_history_size);
+}
+
+// ============================================================
 // Test: repeated positions do not use path-dependent TT scores.
 // ============================================================
 static void test_repetition_sensitive_tt_cutoff_is_skipped() {
@@ -1202,6 +1226,7 @@ int main() {
     test_null_move_pruning_fires();
     test_late_move_pruning();
     test_countermove_ordering();
+    test_continuation_history_and_board_restoration();
     test_repetition_sensitive_tt_cutoff_is_skipped();
     test_quiet_check_moves_bypass_selectivity();
     test_null_move_skipped_in_check();

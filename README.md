@@ -11,7 +11,7 @@ compatible shogi GUI (Shogidroid, ShogiGUI, etc.).
 | Area | What's implemented |
 |---|---|
 | **Rules** | Full 9×9 board, all piece types & promotions, drops, check/checkmate detection, nifu (two-pawn) rule, pawn-drop-mate ban, forced-promotion zones |
-| **Search** | Iterative-deepening alpha-beta, bounded transposition table, quiescence search, improved move ordering, pruning stats, USI info output |
+| **Search** | Iterative-deepening alpha-beta, bounded transposition table, quiescence search, countermove and continuation history, history-aware LMR, pruning stats, USI info output |
 | **Evaluation** | Material + compact KPP-style (King-Piece-Piece) interaction; external KPP parameter file with auto-discovery |
 | **Protocol** | USI: `usi`, `isready`, `position startpos/sfen`, `go`, `stop`, `quit` |
 | **Repetition** | Sennichite detection via Zobrist hashing (returns draw score) |
