@@ -4,22 +4,16 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <vector>
 
-// -----------------------------------------------------------------------
-// Deliberately no <filesystem>: this file must compile with plain C++11
-// (including older MinGW toolchains without <filesystem>/experimental
-// filesystem support). All path handling below is implemented with a
-// handful of small helpers on top of POSIX (readlink/realpath/getcwd) or
-// Win32 (GetModuleFileNameA/GetFullPathNameA) APIs instead.
-// -----------------------------------------------------------------------
 #if defined(_WIN32)
 #include <windows.h>
 #else
-#include <climits>  // PATH_MAX
-#include <unistd.h> // readlink, realpath, getcwd
+#include <climits>
+#include <unistd.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -27,118 +21,39 @@
 
 // ============================================================
 // Bonanza 6.0 "fv.bin" three-piece-relation (KPP/KKP) evaluator
+//   with Incremental KPP/KKP Differential Updates + Eval Hash Cache
 // ============================================================
-// This file implements the classic Bonanza-style evaluation table format:
-// King+Piece+Piece (KPP) and King+King+Piece (KKP) relation tables,
-// loaded verbatim from an unmodified Bonanza 6.0 fv.bin.
+// Layout of genuine Bonanza 6.0 fv.bin (src/client/ini.c `load_fv()` & shogi.h):
+//   1. KPP : int16_t[81][pos_n]     (176,584,212 bytes), pos_n = 1476*1477/2 = 1,090,026
+//   2. KKP : int16_t[81][81][738]   (  9,684,036 bytes)
+//   Total  : 186,268,248 bytes (~177.6 MiB / ~186.3 MB)
 //
-// IMPORTANT (root-cause of a real user-reported bug): an earlier version
-// of this file assumed a 215,824,824-byte layout (KPP int16_t + KKP/KK/KP
-// as int32_t, KKP indexed by the full `fe_end`), based on a *converter*
-// tool's in-memory representation (HiraokaTakuya/apery,
-// utils/bonanzatoapery/main.cpp). That converter's *output* struct sizes
-// are not the same thing as genuine Bonanza's own on-disk fv.bin format,
-// and real user fv.bin files (186,268,248 bytes) were rejected as
-// "invalid size", silently degrading every game to material-only scoring
-// (evaluate() always returning the same material-only value, i.e. "always
-// 0" for symmetric positions).
-//
-// The genuine, verbatim Bonanza 6.0 engine source (mirrored e.g. at
-// puriketu99/bonanza and endlfu/bonanza, src/client/ini.c `load_fv()` and
-// src/client/shogi.h) reads fv.bin as *exactly two* tables, both
-// `short` (int16_t), in this order:
-//   1. KPP : int16_t[SQUARE_NB][pos_n]                        (176,584,212 bytes)
-//            pos_n = fe_end*(fe_end+1)/2, fe_end == 1476 (triangular,
-//            unordered-pair index over the full feature space).
-//   2. KKP : int16_t[SQUARE_NB][SQUARE_NB][kkp_end]             (9,684,036 bytes)
-//            kkp_end == 738 (== fe_end/2): KKP does NOT use the full
-//            fe_end feature space. Because a KKP entry is always looked
-//            up with a specific (my-king, opp-king) pair that already
-//            encodes "whose piece this is" (own pieces use the
-//            unmirrored (SQ_BKING, SQ_WKING) pair; opponent pieces use
-//            the mirrored (Inv(SQ_WKING), Inv(SQ_BKING)) pair, with the
-//            resulting term SUBTRACTED), there is no need for separate
-//            own/enemy feature ids the way KPP has them — halving the
-//            feature space to `kkp_end`.
-//   Total: 186,268,248 bytes. There is NO separate on-disk KK or KP
-//   table — genuine Bonanza's `load_fv()` never reads them (`ini.c`
-//   contains exactly the two `fread()` calls above and nothing else).
-//
-// This is independently confirmed against the *actual byte size* the
-// user's real fv.bin reported: 186,268,248 == 81*1,090,026*2 (KPP) +
-// 81*81*738*2 (KKP), an exact match with no slack.
-//
-// A file whose size happens to match the previous, incorrect
-// 215,824,824-byte assumption is still recognized specially and reported
-// with its own explicit message (rather than a generic size mismatch),
-// per the requirement that unsupported/ambiguous formats must be
-// reported clearly instead of guessed at.
-//
-// The scoring formula implemented in evaluate() below is the classic
-// Bonanza formula, transcribed directly from genuine Bonanza source
-// (src/client/evaluate.c: `evaluate()` / `make_list()`), not a
-// re-derived approximation:
-//   - FV_SCALE == 32 (src/client/shogi.h: `#define FV_SCALE 32`).
-//   - The score is always accumulated from BLACK's point of view and
-//     negated at the very end if White is to move.
-//   - KKP: exactly ONE term per non-king piece (hand or board), added
-//     for Black's own pieces (looked up at kkp[SQ_BKING][SQ_WKING][idx],
-//     idx = kkp_<piece>_offset + own-hand-count or absolute board
-//     square) and SUBTRACTED for White's own pieces (looked up at
-//     kkp[Inv(SQ_WKING)][Inv(SQ_BKING)][idx], idx using the *mirrored*
-//     board square for board pieces). Promoted minor pieces (と/成香/
-//     成桂/成銀) share GOLD's slot; promoted bishop/rook use HORSE/DRAGON.
-//   - KPP: the two-piece term is summed over EVERY unordered pair
-//     (i, j) with i >= j *including the diagonal i == j* (see
-//     `evaluate()`'s `for (j = 0; j <= i; j++)`, not `j < i`) — once from
-//     Black's own point of view (own king square, Black's feature list)
-//     and once from White's point of view (Black-mirrored White king
-//     square, White's feature list), with the second sum SUBTRACTED.
-//   - A separate material term (see FALLBACK_PIECE_VALUE below) is added
-//     on top, scaled by FV_SCALE, exactly like the rest of the summation
-//     (`score += MATERIAL * FV_SCALE;` in genuine Bonanza).
+// Critical coordinate conventions matching genuine Bonanza 6.0:
+//   - Board square indexing in Bonanza (`enum { A9=0, A8=1, ..., A1=8, B9=9, ..., I1=80 }`)
+//     is RANK-MAJOR (`rank * 9 + file`, file 9->1 = 0..8, rank a->i = 0..8), which is
+//     IDENTICAL to `Square` in `types.hpp` (`to_bonanza_sq(s) == s`).
+//   - Hand piece features in KPP (`FOO` macro in Bonanza `evaluate.c` `make_list()`) are
+//     1-BASED (`f_hand_pawn + 1 .. f_hand_pawn + count`), whereas KKP hand lookups index
+//     directly by count (`kkp_hand_pawn + count`, `0 .. count`).
 
 namespace {
 
-// -----------------------------------------------------------------------
-// Path to the repository's src/eval/ directory, baked in at compile time
-// (see CMakeLists.txt: -DSHOGIAI_SOURCE_DIR="${CMAKE_SOURCE_DIR}"). This
-// gives auto-discovery an absolute, cwd-independent candidate that always
-// resolves to the same fv.bin the user placed in the checked-out source
-// tree, regardless of which directory the engine is launched from.
-// -----------------------------------------------------------------------
 #ifndef SHOGIAI_SOURCE_DIR
 #define SHOGIAI_SOURCE_DIR ""
 #endif
 
-// Portable (filesystem-free) path helpers
-// -----------------------------------------------------------------------
-// Minimal replacements for the small subset of std::filesystem::path
-// functionality this file needs (parent_path()/canonical()/absolute()),
-// implemented with plain C++11 + POSIX/Win32 APIs so this translation
-// unit compiles without <filesystem> (unavailable on some older MinGW
-// toolchains and pre-C++17 standard libraries).
-// -----------------------------------------------------------------------
 #if !defined(_WIN32) && !defined(PATH_MAX)
 #define PATH_MAX 4096
 #endif
 
-// Directory part of `path` (everything before the last '/' or '\\'), or
-// "" if there is no separator. Mirrors std::filesystem::path::parent_path()
-// closely enough for building discovery candidates below.
 std::string path_parent_dir(const std::string& path) {
     const std::string::size_type pos = path.find_last_of("/\\");
     if (pos == std::string::npos) return std::string();
-    if (pos == 0) return path.substr(0, 1); // root, e.g. "/"
+    if (pos == 0) return path.substr(0, 1);
     return path.substr(0, pos);
 }
 
 #if !defined(_WIN32)
-// Resolves symlinks / "." / ".." components, matching what
-// std::filesystem::canonical() did for the POSIX branches below. Requires
-// the path to exist (both call sites here only use it on paths that are
-// already known to exist). Falls back to the input path unchanged if
-// resolution fails.
 std::string canonicalize_existing_path(const std::string& path) {
     char resolved[PATH_MAX];
     if (realpath(path.c_str(), resolved) != nullptr) return std::string(resolved);
@@ -146,18 +61,10 @@ std::string canonicalize_existing_path(const std::string& path) {
 }
 #endif
 
-// Directory containing the running executable, or "" if it cannot be
-// determined on this platform. Used to build cwd-independent discovery
-// candidates relative to where the binary actually lives (e.g. the CMake
-// build tree), which matters because most USI GUIs launch the engine with
-// an arbitrary working directory, not the build or repository directory.
 std::string get_executable_dir() {
 #if defined(__linux__)
     char buf[4096];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    // readlink() silently truncates (no null terminator, and returns the
-    // full requested count) if the real path doesn't fit; treat that as
-    // "undeterminable" rather than risk a corrupted/truncated path.
     if (len > 0 && len < static_cast<ssize_t>(sizeof(buf) - 1)) {
         buf[len] = '\0';
         return path_parent_dir(canonicalize_existing_path(buf));
@@ -172,9 +79,6 @@ std::string get_executable_dir() {
     char buf[MAX_PATH];
     SetLastError(ERROR_SUCCESS);
     DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    // GetModuleFileNameA() truncates silently on some Windows versions
-    // when the path doesn't fit, without len reaching MAX_PATH; checking
-    // GetLastError() for ERROR_INSUFFICIENT_BUFFER catches that case too.
     if (len > 0 && len < MAX_PATH && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
         return path_parent_dir(std::string(buf));
     }
@@ -182,9 +86,6 @@ std::string get_executable_dir() {
     return "";
 }
 
-// Best-effort absolute form of `path` (used only for cosmetic status
-// messages, so falling back to the original relative path on failure is
-// acceptable). `path` is expected to already exist at the call site.
 std::string make_absolute_path(const std::string& path) {
 #if defined(_WIN32)
     char buf[MAX_PATH];
@@ -196,25 +97,11 @@ std::string make_absolute_path(const std::string& path) {
 #endif
 }
 
-// -----------------------------------------------------------------------
-// Automatic discovery candidates (tried in order when no explicit path is
-// set via setoption/set_eval_file_path/SHOGIAI_EVAL_FILE). Built fresh on
-// every call so it reflects the *current* working directory (tests change
-// cwd at runtime) while still preferring cwd-independent locations first.
-// -----------------------------------------------------------------------
 std::vector<std::string> build_discovery_candidates() {
     std::vector<std::string> v;
-
-    // Priority A: compile-time repository path (works regardless of cwd
-    // or where the built binary was copied/launched from).
     if (SHOGIAI_SOURCE_DIR[0] != '\0') {
         v.push_back(std::string(SHOGIAI_SOURCE_DIR) + "/src/eval/fv.bin");
     }
-
-    // Priority B: paths relative to the running executable's own
-    // directory (covers "cmake --build" trees where fv.bin was copied
-    // next to the binary, and users who copy the binary elsewhere but
-    // keep fv.bin alongside it).
     const std::string exe_dir = get_executable_dir();
     if (!exe_dir.empty()) {
         v.push_back(exe_dir + "/eval/fv.bin");
@@ -222,20 +109,13 @@ std::vector<std::string> build_discovery_candidates() {
         v.push_back(exe_dir + "/../eval/fv.bin");
         v.push_back(exe_dir + "/../src/eval/fv.bin");
     }
-
-    // Priority C: paths relative to the current working directory, kept
-    // for backward compatibility with users who launch from the build
-    // directory or the repository root.
     v.push_back("src/eval/fv.bin");
     v.push_back("eval/fv.bin");
-
     return v;
 }
 
 // -----------------------------------------------------------------------
-// Bonanza feature-space constants (see file header comment for provenance).
-// These are the KPP (full fe_end) feature offsets: verbatim from genuine
-// Bonanza 6.0 (src/client/shogi.h).
+// Bonanza 6.0 KPP & KKP feature offsets (verbatim from shogi.h)
 // -----------------------------------------------------------------------
 enum {
     f_hand_pawn = 0,   e_hand_pawn = 19,  f_hand_lance = 38,  e_hand_lance = 43,
@@ -250,12 +130,6 @@ enum {
     f_dragon = 1314, e_dragon = 1395, fe_end = 1476
 };
 
-// KKP-specific (halved, kkp_end == fe_end/2) feature offsets: also
-// verbatim from genuine Bonanza 6.0 (src/client/shogi.h). KKP does not
-// distinguish "own" (f_) vs "enemy" (e_) pieces with separate offsets the
-// way KPP does — that distinction is carried instead by which king-pair
-// (own unmirrored vs opponent mirrored) is used to index the table, and
-// by whether the resulting term is added or subtracted (see evaluate()).
 enum {
     kkp_hand_pawn = 0,  kkp_hand_lance = 19, kkp_hand_knight = 24,
     kkp_hand_silver = 29, kkp_hand_gold = 34, kkp_hand_bishop = 39,
@@ -271,85 +145,103 @@ constexpr int64_t POS_N   = static_cast<int64_t>(fe_end) * (fe_end + 1) / 2;
 constexpr int64_t KPP_CNT = SQ_NB * POS_N;
 constexpr int64_t KKP_CNT = SQ_NB * SQ_NB * static_cast<int64_t>(kkp_end);
 
-constexpr int64_t KPP_BYTES = KPP_CNT * static_cast<int64_t>(sizeof(int16_t));
-constexpr int64_t KKP_BYTES = KKP_CNT * static_cast<int64_t>(sizeof(int16_t));
+constexpr int64_t KPP_BYTES    = KPP_CNT * static_cast<int64_t>(sizeof(int16_t));
+constexpr int64_t KKP_BYTES    = KKP_CNT * static_cast<int64_t>(sizeof(int16_t));
 constexpr int64_t FV_BIN_BYTES = KPP_BYTES + KKP_BYTES; // 186,268,248
-
-// Size of the previous (incorrect) 215,824,824-byte assumption, kept only
-// so a file of that size can be reported with a specific, actionable
-// message instead of a generic "invalid size" one (see try_load_from_path).
 constexpr int64_t LEGACY_APERY_LAYOUT_BYTES = 215824824;
 
-// Piece values used for the material term. Used as the *entire* score for
-// MATERIAL_FALLBACK (no valid fv.bin present), and as an additive term
-// summed alongside the KKP/KPP relation terms when a real fv.bin is loaded
-// (BONANZA_V6_FV) — matching genuine Bonanza, which always adds a
-// separately-computed material term rather than relying on it being
-// implicit in the relation tables (see file header comment for
-// provenance).
-constexpr std::array<int, PT_NB> FALLBACK_PIECE_VALUE{
-0, 87, 232, 257, 369, 444, 569, 642, 0, 534, 489, 510, 495, 827, 945    
-};
+// Precomputed triangular row base `x * (x + 1) / 2` for 0 <= x < fe_end
+const std::array<int64_t, fe_end> TRI_BASE = [] {
+    std::array<int64_t, fe_end> a{};
+    for (int i = 0; i < fe_end; ++i)
+        a[i] = static_cast<int64_t>(i) * (i + 1) / 2;
+    return a;
+}();
 
-// Bonanza's classic fixed-point scale: raw KPP/KKP table units are 32x a
-// centipawn, so the material term (in centipawns) must be multiplied by
-// FV_SCALE before being summed with them, and the grand total divided by
-// FV_SCALE at the very end. Confirmed via kobanium/aobazero
-// src/usi-engine/bona/shogi.h (`#define FV_SCALE 32`).
-constexpr int64_t FV_SCALE = 32;
-
-// -----------------------------------------------------------------------
-// Global state
-// -----------------------------------------------------------------------
 struct FvTables {
-    std::vector<int16_t> kpp; // [SQ_NB][pos_n]     (triangular, full fe_end space)
+    std::vector<int16_t> kpp; // [SQ_NB][pos_n]
     std::vector<int16_t> kkp; // [SQ_NB][SQ_NB][kkp_end]
 };
 
+// Evaluation Hash Table (4 MiB: caches final Black-POV centipawn score by Zobrist key)
+constexpr size_t EHASH_SIZE = 1u << 18;
+constexpr size_t EHASH_MASK = EHASH_SIZE - 1;
+struct EvalHashEntry {
+    uint64_t key = 0;
+    int32_t  score_black = 0;
+    uint32_t epoch = 0;
+};
+
+// Incremental Parent-State Cache (8,192 entries: caches KPP/KKP accumulators + feature lists)
+constexpr size_t STATE_CACHE_SIZE = 1u << 13;
+constexpr size_t STATE_CACHE_MASK = STATE_CACHE_SIZE - 1;
+struct EvalStateEntry {
+    uint64_t key = 0;
+    uint32_t epoch = 0;
+    int16_t  sq_bk = -1;
+    int16_t  sq_wk = -1;
+    uint8_t  nlist = 0;
+    int64_t  sum_bkpp = 0;
+    int64_t  sum_wkpp = 0;
+    int64_t  sum_kkp  = 0;
+    int16_t  list0[44]{};
+    int16_t  list1[44]{};
+};
+
 bool        g_loaded_once   = false;
-bool        g_explicit_path = false; // true if set via set_eval_file_path(non-empty)
-std::string g_eval_file_path;        // empty = use auto-discovery
-std::string g_status  = "material-only fallback (fv.bin missing)";
-EvalFamily  g_family   = EvalFamily::MATERIAL_FALLBACK;
-FvTables    g_tables;                // populated only when g_family == BONANZA_V6_FV
+bool        g_explicit_path = false;
+int64_t     g_fv_scale      = 32;
+uint32_t    g_eval_epoch    = 1;
+std::string g_eval_file_path;
+std::string g_status        = "material-only fallback (fv.bin missing)";
+EvalFamily  g_family        = EvalFamily::MATERIAL_FALLBACK;
+FvTables    g_tables;
+
+std::vector<EvalHashEntry>  g_ehash(EHASH_SIZE);
+std::vector<EvalStateEntry> g_state_cache(STATE_CACHE_SIZE);
+
+inline void bump_eval_epoch() {
+    if (++g_eval_epoch == 0) {
+        std::fill(g_ehash.begin(), g_ehash.end(), EvalHashEntry{});
+        std::fill(g_state_cache.begin(), g_state_cache.end(), EvalStateEntry{});
+        g_eval_epoch = 1;
+    }
+}
 
 // -----------------------------------------------------------------------
-// Bonanza square: file-major, file counted 9→1 (left→right from Black's
-// side), rank counted a→i (top→bottom). Our own Square is rank-major with
-// file 0 == USI file '9', so bonanza_sq == file_of(s)*9 + rank_of(s).
+// Bonanza square & feature helpers
 // -----------------------------------------------------------------------
-inline int to_bonanza_sq(Square s) { return file_of(s) * 9 + rank_of(s); }
-// 180-degree board rotation, used to view the board from White's side.
-inline int mirror_sq(int bsq) { return static_cast<int>(SQ_NB) - 1 - bsq; }
-
-// Bonanza square of `s`, as seen from `view`'s point of view (mirrored
-// 180 degrees when `view == WHITE` so every KPP/KKP/KP lookup is always
-// expressed "facing" the side whose king is being indexed).
+// Bonanza's A9..I1 square numbering is rank-major (`rank * 9 + file`),
+// identical to `Square` in `types.hpp`!
+inline int to_bonanza_sq(Square s) { return static_cast<int>(s); }
+inline int mirror_sq(int bsq)      { return static_cast<int>(SQ_NB) - 1 - bsq; }
 inline int view_sq(Square s, Color view) {
     const int bsq = to_bonanza_sq(s);
     return (view == WHITE) ? mirror_sq(bsq) : bsq;
 }
 
-// Triangular (unordered pair) index into the KPP table's `pos_n` axis.
 inline int64_t triangular_index(int a, int b) {
-    const int hi = std::max(a, b);
-    const int lo = std::min(a, b);
-    return static_cast<int64_t>(hi) * (hi + 1) / 2 + lo;
+    return (a >= b) ? (TRI_BASE[a] + b) : (TRI_BASE[b] + a);
 }
 
-// KKP table lookup: `idx` must already be a kkp-space index (either
-// kkp_hand_<piece> + hand-count, or kkp_<piece> + a board square — see
-// hand_kkp_base()/board_kkp_base() below), NOT a full fe_end feature id.
 inline int kkp_lookup(int my_king, int opp_king, int idx) {
     return g_tables.kkp[(static_cast<int64_t>(my_king) * SQ_NB + opp_king) * kkp_end + idx];
 }
-inline int kpp_lookup(int my_king, int fe_a, int fe_b) {
-    return g_tables.kpp[static_cast<int64_t>(my_king) * POS_N + triangular_index(fe_a, fe_b)];
+
+inline int max_hand_count(PieceType pt) {
+    switch (pt) {
+        case PAWN:   return 18;
+        case LANCE:
+        case KNIGHT:
+        case SILVER:
+        case GOLD:   return 4;
+        case BISHOP:
+        case ROOK:   return 2;
+        default:     return 0;
+    }
 }
 
-// kkp-space base offset for one unit of a hand piece (own/enemy is NOT
-// distinguished here — see file header comment).
-int hand_kkp_base(PieceType pt) {
+inline int hand_kkp_base(PieceType pt) {
     switch (pt) {
         case PAWN:   return kkp_hand_pawn;
         case LANCE:  return kkp_hand_lance;
@@ -362,20 +254,16 @@ int hand_kkp_base(PieceType pt) {
     }
 }
 
-// kkp-space base offset for a board piece (own/enemy is NOT distinguished
-// here — see file header comment). Promoted minor pieces share GOLD's
-// slot (they move like GOLD in Bonanza's feature space); promoted
-// bishop/rook use HORSE/DRAGON, matching board_feature_base() below.
-int board_kkp_base(PieceType pt) {
+inline int board_kkp_base(PieceType pt) {
     switch (pt) {
         case PAWN:        return kkp_pawn;
         case LANCE:       return kkp_lance;
         case KNIGHT:      return kkp_knight;
         case SILVER:      return kkp_silver;
-        case GOLD:        return kkp_gold;
-        case PROM_PAWN:   return kkp_gold;
-        case PROM_LANCE:  return kkp_gold;
-        case PROM_KNIGHT: return kkp_gold;
+        case GOLD:
+        case PROM_PAWN:
+        case PROM_LANCE:
+        case PROM_KNIGHT:
         case PROM_SILVER: return kkp_gold;
         case BISHOP:      return kkp_bishop;
         case PROM_BISHOP: return kkp_horse;
@@ -385,8 +273,7 @@ int board_kkp_base(PieceType pt) {
     }
 }
 
-// Base feature offset (own="f_", enemy="e_") for one unit of a hand piece.
-int hand_feature_base(PieceType pt, bool own) {
+inline int hand_feature_base(PieceType pt, bool own) {
     switch (pt) {
         case PAWN:   return own ? f_hand_pawn   : e_hand_pawn;
         case LANCE:  return own ? f_hand_lance  : e_hand_lance;
@@ -399,53 +286,320 @@ int hand_feature_base(PieceType pt, bool own) {
     }
 }
 
-// Base feature offset for a board piece occupying a square (own/enemy).
-int board_feature_base(PieceType pt, bool own) {
+inline int board_feature_base(PieceType pt, bool own) {
     switch (pt) {
         case PAWN:        return own ? f_pawn   : e_pawn;
         case LANCE:       return own ? f_lance  : e_lance;
         case KNIGHT:      return own ? f_knight : e_knight;
         case SILVER:      return own ? f_silver : e_silver;
-        case GOLD:        return own ? f_gold   : e_gold;
-        case BISHOP:      return own ? f_bishop : e_bishop;
-        case ROOK:        return own ? f_rook   : e_rook;
-        case PROM_PAWN:   return own ? f_gold   : e_gold;   // promoted minor pieces
-        case PROM_LANCE:  return own ? f_gold   : e_gold;   // move like GOLD in Bonanza's
-        case PROM_KNIGHT: return own ? f_gold   : e_gold;   // KPP/KKP feature space.
+        case GOLD:
+        case PROM_PAWN:
+        case PROM_LANCE:
+        case PROM_KNIGHT:
         case PROM_SILVER: return own ? f_gold   : e_gold;
+        case BISHOP:      return own ? f_bishop : e_bishop;
         case PROM_BISHOP: return own ? f_horse  : e_horse;
+        case ROOK:        return own ? f_rook   : e_rook;
         case PROM_ROOK:   return own ? f_dragon : e_dragon;
         default:          return -1;
     }
 }
 
-// Build the list of non-king feature indices as seen from `view`'s own
-// perspective (own pieces use f_*, opponent pieces use e_*; squares are
-// mirrored when view == WHITE so that the board is always presented
-// "facing" the viewing side, matching Bonanza's own convention).
-std::vector<int> build_feature_list(const Board& board, Color view) {
-    std::vector<int> list;
-    list.reserve(40);
+// Bounds-checked board KPP feature index (`-1` if piece sits on an illegal dead rank in synthetic SFEN)
+inline int board_feature_checked(Color pc, PieceType pt, Square s, Color view) {
+    const bool own = (pc == view);
+    const int base = board_feature_base(pt, own);
+    if (base < 0) return -1;
+    const int vsq = view_sq(s, view);
+    if (pt == PAWN || pt == LANCE) {
+        if (own ? (vsq < 9) : (vsq > 71)) return -1;
+    } else if (pt == KNIGHT) {
+        if (own ? (vsq < 18) : (vsq > 62)) return -1;
+    }
+    const int idx = base + vsq;
+    return (idx >= fe_hand_end && idx < fe_end) ? idx : -1;
+}
 
-    for (int pt = PAWN; pt <= ROOK; ++pt) {
-        if (hand_feature_base(static_cast<PieceType>(pt), true) < 0) continue;
-        for (Color side : {BLACK, WHITE}) {
-            const bool own = (side == view);
-            const int base = hand_feature_base(static_cast<PieceType>(pt), own);
-            const int count = board.hand(side, static_cast<PieceType>(pt));
-            for (int k = 0; k < count; ++k) list.push_back(base + k);
+// Bounds-checked board KKP index (`-1` if illegal dead rank in synthetic SFEN)
+inline int board_kkp_checked(Color pc, PieceType pt, Square s) {
+    const int bb = board_kkp_base(pt);
+    if (bb < 0) return -1;
+    const int own_sq = (pc == BLACK) ? to_bonanza_sq(s) : mirror_sq(to_bonanza_sq(s));
+    if (pt == PAWN || pt == LANCE) {
+        if (own_sq < 9) return -1;
+    } else if (pt == KNIGHT) {
+        if (own_sq < 18) return -1;
+    }
+    const int idx = bb + own_sq;
+    return (idx >= kkp_hand_end && idx < kkp_end) ? idx : -1;
+}
+
+// Compute full KPP sum for a feature list using sorted sequential row pointers
+int64_t compute_kpp_sum_sorted(int king_sq, const int16_t* raw_list, int n) {
+    int16_t sorted[44];
+    for (int i = 0; i < n; ++i) sorted[i] = raw_list[i];
+    // Tiny insertion sort (`n <= 38`) makes inner row reads strictly sequential (`sorted[j] <= sorted[i]`)
+    for (int i = 1; i < n; ++i) {
+        int16_t key = sorted[i];
+        int j = i - 1;
+        while (j >= 0 && sorted[j] > key) {
+            sorted[j + 1] = sorted[j];
+            --j;
         }
+        sorted[j + 1] = key;
     }
 
+    const int16_t* kpp_king = &g_tables.kpp[static_cast<int64_t>(king_sq) * POS_N];
+    int64_t sum = 0;
+    for (int i = 0; i < n; ++i) {
+        const int16_t* row = kpp_king + TRI_BASE[sorted[i]];
+        int64_t row_sum = 0;
+        for (int j = 0; j <= i; ++j) {
+            row_sum += row[sorted[j]];
+        }
+        sum += row_sum;
+    }
+    return sum;
+}
+
+int64_t compute_kkp_sum_full(const Board& board, int sq_bk, int sq_wk, int sq_bk_inv, int sq_wk_inv) {
+    int64_t sum_kkp = 0;
+    for (int pt = PAWN; pt <= ROOK; ++pt) {
+        const PieceType ptype = static_cast<PieceType>(pt);
+        const int hb = hand_kkp_base(ptype);
+        if (hb < 0) continue;
+        const int max_c = max_hand_count(ptype);
+        const int cb = std::clamp(board.hand(BLACK, ptype), 0, max_c);
+        const int cw = std::clamp(board.hand(WHITE, ptype), 0, max_c);
+        sum_kkp += kkp_lookup(sq_bk, sq_wk, hb + cb);
+        sum_kkp -= kkp_lookup(sq_wk_inv, sq_bk_inv, hb + cw);
+    }
     for (int s = 0; s < SQUARE_NB; ++s) {
         const Piece p = board.piece_at(s);
         if (p == NO_PIECE || type_of(p) == KING) continue;
-        const bool own = (color_of(p) == view);
-        const int base = board_feature_base(type_of(p), own);
-        if (base < 0) continue;
-        list.push_back(base + view_sq(s, view));
+        const int idx = board_kkp_checked(color_of(p), type_of(p), s);
+        if (idx < 0) continue;
+        if (color_of(p) == BLACK) {
+            sum_kkp += kkp_lookup(sq_bk, sq_wk, idx);
+        } else {
+            sum_kkp -= kkp_lookup(sq_wk_inv, sq_bk_inv, idx);
+        }
     }
-    return list;
+    return sum_kkp;
+}
+
+// Single-feature differential update on `list[0..n-1]` (exact including diagonal `i == j`)
+inline bool replace_kpp_feature(int king_sq, int16_t* list, int n, int old_f, int new_f, int64_t& sum) {
+    if (old_f < 0 || new_f < 0) return false;
+    int pos = -1;
+    for (int i = 0; i < n; ++i) {
+        if (list[i] == old_f) { pos = i; break; }
+    }
+    if (pos < 0) return false;
+
+    const int16_t* kpp_king = &g_tables.kpp[static_cast<int64_t>(king_sq) * POS_N];
+    const int16_t* old_row  = kpp_king + TRI_BASE[old_f];
+    int64_t delta = 0;
+    for (int k = 0; k < n; ++k) {
+        const int fk = list[k];
+        delta -= (old_f >= fk) ? old_row[fk] : kpp_king[TRI_BASE[fk] + old_f];
+    }
+    list[pos] = static_cast<int16_t>(new_f);
+    const int16_t* new_row = kpp_king + TRI_BASE[new_f];
+    for (int k = 0; k < n; ++k) {
+        const int fk = list[k];
+        delta += (new_f >= fk) ? new_row[fk] : kpp_king[TRI_BASE[fk] + new_f];
+    }
+    sum += delta;
+    return true;
+}
+
+void build_full_eval_state(const Board& board, EvalStateEntry& st) {
+    const int sq_bk     = to_bonanza_sq(board.king_sq(BLACK));
+    const int sq_wk     = to_bonanza_sq(board.king_sq(WHITE));
+    const int sq_bk_inv = mirror_sq(sq_bk);
+    const int sq_wk_inv = mirror_sq(sq_wk);
+
+    st.key   = board.hash();
+    st.epoch = g_eval_epoch;
+    st.sq_bk = static_cast<int16_t>(sq_bk);
+    st.sq_wk = static_cast<int16_t>(sq_wk);
+
+    int n = 0;
+    // Hand features: 1-based (`base + 1 .. base + count`), matching Bonanza `FOO` macro!
+    for (int pt = PAWN; pt <= ROOK; ++pt) {
+        const PieceType ptype = static_cast<PieceType>(pt);
+        const int max_c = max_hand_count(ptype);
+        for (Color side : {BLACK, WHITE}) {
+            const int cnt = std::clamp(board.hand(side, ptype), 0, max_c);
+            if (cnt <= 0) continue;
+            const int b0 = hand_feature_base(ptype, side == BLACK);
+            const int b1 = hand_feature_base(ptype, side == WHITE);
+            for (int k = 1; k <= cnt && n < 42; ++k) {
+                st.list0[n] = static_cast<int16_t>(b0 + k);
+                st.list1[n] = static_cast<int16_t>(b1 + k);
+                ++n;
+            }
+        }
+    }
+    for (int s = 0; s < SQUARE_NB && n < 42; ++s) {
+        const Piece p = board.piece_at(s);
+        if (p == NO_PIECE || type_of(p) == KING) continue;
+        const int f0 = board_feature_checked(color_of(p), type_of(p), s, BLACK);
+        const int f1 = board_feature_checked(color_of(p), type_of(p), s, WHITE);
+        if (f0 < 0 || f1 < 0) continue;
+        st.list0[n] = static_cast<int16_t>(f0);
+        st.list1[n] = static_cast<int16_t>(f1);
+        ++n;
+    }
+
+    st.nlist    = static_cast<uint8_t>(n);
+    st.sum_bkpp = compute_kpp_sum_sorted(sq_bk, st.list0, n);
+    st.sum_wkpp = compute_kpp_sum_sorted(sq_wk_inv, st.list1, n);
+    st.sum_kkp  = compute_kkp_sum_full(board, sq_bk, sq_wk, sq_bk_inv, sq_wk_inv);
+}
+
+// Attempt incremental update from parent state in `g_state_cache`
+bool try_incremental_eval_state(const Board& board, EvalStateEntry& cur) {
+    if (board.history_.empty()) return false;
+    const StateInfo& si = board.history_.back();
+    const EvalStateEntry& parent = g_state_cache[si.hash & STATE_CACHE_MASK];
+    if (parent.epoch != g_eval_epoch || parent.key != si.hash)
+        return false;
+
+    // 1. Null move: kings, hands, and board pieces are completely unchanged!
+    if (si.null_move) {
+        cur = parent;
+        cur.key = board.hash();
+        return true;
+    }
+
+    const Move  m     = si.move;
+    const Color mover = si.mover;
+    if (m == MOVE_NONE) return false;
+
+    const int sq_bk     = to_bonanza_sq(board.king_sq(BLACK));
+    const int sq_wk     = to_bonanza_sq(board.king_sq(WHITE));
+    const int sq_bk_inv = mirror_sq(sq_bk);
+    const int sq_wk_inv = mirror_sq(sq_wk);
+
+    // 2. King move: if non-capturing, reuse the other king's KPP sum (Yaneurao's single-king diff!)
+    if (!is_drop(m) && type_of(si.moved_piece) == KING) {
+        if (si.captured != NO_PIECE) return false; // King capture: fall back to full state build
+        cur = parent;
+        cur.key   = board.hash();
+        cur.sq_bk = static_cast<int16_t>(sq_bk);
+        cur.sq_wk = static_cast<int16_t>(sq_wk);
+        if (mover == BLACK) {
+            cur.sum_bkpp = compute_kpp_sum_sorted(sq_bk, cur.list0, cur.nlist);
+        } else {
+            cur.sum_wkpp = compute_kpp_sum_sorted(sq_wk_inv, cur.list1, cur.nlist);
+        }
+        cur.sum_kkp = compute_kkp_sum_full(board, sq_bk, sq_wk, sq_bk_inv, sq_wk_inv);
+        return true;
+    }
+
+    if (si.captured != NO_PIECE && type_of(si.captured) == KING)
+        return false;
+
+    // 3. Non-king move (drop, quiet, promote, or capture): neither king moved!
+    if (parent.sq_bk != sq_bk || parent.sq_wk != sq_wk)
+        return false;
+
+    cur = parent;
+    cur.key = board.hash();
+    const int n = cur.nlist;
+
+    if (is_drop(m)) {
+        const PieceType pt = dropped_pt(m);
+        const Square    to = to_sq(m);
+        const int max_c   = max_hand_count(pt);
+        const int new_cnt = board.hand(mover, pt);
+        const int old_cnt = new_cnt + 1;
+        if (new_cnt < 0 || old_cnt > max_c) return false;
+
+        const int old_f0 = hand_feature_base(pt, mover == BLACK) + old_cnt;
+        const int new_f0 = board_feature_checked(mover, pt, to, BLACK);
+        const int old_f1 = hand_feature_base(pt, mover == WHITE) + old_cnt;
+        const int new_f1 = board_feature_checked(mover, pt, to, WHITE);
+        const int bb_idx = board_kkp_checked(mover, pt, to);
+        const int hb     = hand_kkp_base(pt);
+        if (bb_idx < 0 || hb < 0) return false;
+
+        if (!replace_kpp_feature(sq_bk, cur.list0, n, old_f0, new_f0, cur.sum_bkpp)) return false;
+        if (!replace_kpp_feature(sq_wk_inv, cur.list1, n, old_f1, new_f1, cur.sum_wkpp)) return false;
+
+        if (mover == BLACK) {
+            cur.sum_kkp += -kkp_lookup(sq_bk, sq_wk, hb + old_cnt)
+                          + kkp_lookup(sq_bk, sq_wk, hb + new_cnt)
+                          + kkp_lookup(sq_bk, sq_wk, bb_idx);
+        } else {
+            cur.sum_kkp -= -kkp_lookup(sq_wk_inv, sq_bk_inv, hb + old_cnt)
+                          + kkp_lookup(sq_wk_inv, sq_bk_inv, hb + new_cnt)
+                          + kkp_lookup(sq_wk_inv, sq_bk_inv, bb_idx);
+        }
+        return true;
+    }
+
+    // Normal / promote move
+    const Square    from    = from_sq(m);
+    const Square    to      = to_sq(m);
+    const PieceType now_pt  = type_of(si.moved_piece);
+    const PieceType orig_pt = is_promote(m) ? unpromote_pt(now_pt) : now_pt;
+
+    const int old_f0 = board_feature_checked(mover, orig_pt, from, BLACK);
+    const int new_f0 = board_feature_checked(mover, now_pt,  to,   BLACK);
+    const int old_f1 = board_feature_checked(mover, orig_pt, from, WHITE);
+    const int new_f1 = board_feature_checked(mover, now_pt,  to,   WHITE);
+    const int kkp_old_m = board_kkp_checked(mover, orig_pt, from);
+    const int kkp_new_m = board_kkp_checked(mover, now_pt,  to);
+    if (kkp_old_m < 0 || kkp_new_m < 0) return false;
+
+    if (!replace_kpp_feature(sq_bk, cur.list0, n, old_f0, new_f0, cur.sum_bkpp)) return false;
+    if (!replace_kpp_feature(sq_wk_inv, cur.list1, n, old_f1, new_f1, cur.sum_wkpp)) return false;
+
+    if (mover == BLACK) {
+        cur.sum_kkp += -kkp_lookup(sq_bk, sq_wk, kkp_old_m)
+                      + kkp_lookup(sq_bk, sq_wk, kkp_new_m);
+    } else {
+        cur.sum_kkp -= -kkp_lookup(sq_wk_inv, sq_bk_inv, kkp_old_m)
+                      + kkp_lookup(sq_wk_inv, sq_bk_inv, kkp_new_m);
+    }
+
+    if (si.captured != NO_PIECE) {
+        const Color     them        = ~mover;
+        const PieceType cap_pt      = type_of(si.captured);
+        const PieceType cap_hand_pt = to_hand_pt(cap_pt);
+        const int       max_c       = max_hand_count(cap_hand_pt);
+        const int       new_cnt     = board.hand(mover, cap_hand_pt);
+        const int       old_cnt     = new_cnt - 1;
+        if (old_cnt < 0 || new_cnt > max_c) return false;
+
+        const int cap_old_f0    = board_feature_checked(them, cap_pt, to, BLACK);
+        const int cap_new_f0    = hand_feature_base(cap_hand_pt, mover == BLACK) + new_cnt;
+        const int cap_old_f1    = board_feature_checked(them, cap_pt, to, WHITE);
+        const int cap_new_f1    = hand_feature_base(cap_hand_pt, mover == WHITE) + new_cnt;
+        const int kkp_cap_board = board_kkp_checked(them, cap_pt, to);
+        const int hb            = hand_kkp_base(cap_hand_pt);
+        if (kkp_cap_board < 0 || hb < 0) return false;
+
+        if (!replace_kpp_feature(sq_bk, cur.list0, n, cap_old_f0, cap_new_f0, cur.sum_bkpp)) return false;
+        if (!replace_kpp_feature(sq_wk_inv, cur.list1, n, cap_old_f1, cap_new_f1, cur.sum_wkpp)) return false;
+
+        if (mover == BLACK) {
+            // Captured a WHITE piece (which had been subtracted in sum_kkp) + BLACK gained hand piece
+            cur.sum_kkp += kkp_lookup(sq_wk_inv, sq_bk_inv, kkp_cap_board)
+                         - kkp_lookup(sq_bk, sq_wk, hb + old_cnt)
+                         + kkp_lookup(sq_bk, sq_wk, hb + new_cnt);
+        } else {
+            // Captured a BLACK piece (which had been added in sum_kkp) + WHITE gained hand piece
+            cur.sum_kkp += -kkp_lookup(sq_bk, sq_wk, kkp_cap_board)
+                          + kkp_lookup(sq_wk_inv, sq_bk_inv, hb + old_cnt)
+                          - kkp_lookup(sq_wk_inv, sq_bk_inv, hb + new_cnt);
+        }
+    }
+
+    return true;
 }
 
 // -----------------------------------------------------------------------
@@ -464,7 +618,7 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
         g_status = "unsupported evaluator: nnue (falling back to material-only; source: "
                  + path + " [" + tag + "])";
         g_family = EvalFamily::NNUE_UNSUPPORTED;
-        return false; // stop auto-discovery too; the file was placed intentionally.
+        return false;
     }
 
     std::ifstream ifs(path, std::ios::binary);
@@ -482,12 +636,6 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
 
     if (size != static_cast<std::streamoff>(FV_BIN_BYTES)) {
         if (size == static_cast<std::streamoff>(LEGACY_APERY_LAYOUT_BYTES)) {
-            // Explicitly recognized: this is the size a previous version of
-            // this loader incorrectly assumed for "Bonanza v6" (based on a
-            // converter tool's expanded in-memory struct sizes, not genuine
-            // Bonanza's own on-disk format). Report this distinctly instead
-            // of a generic size mismatch, since it is a known-but-unsupported
-            // layout rather than an arbitrary wrong-sized file.
             g_status = "material-only fallback (unsupported fv.bin layout: got "
                      + std::to_string(static_cast<long long>(size))
                      + " bytes, which matches the Apery bonanzatoapery converter's "
@@ -519,10 +667,11 @@ bool try_load_from_path(const std::string& path, bool is_auto) {
     }
 
     g_tables = std::move(loaded);
+    bump_eval_epoch();
     const std::string abs_path = make_absolute_path(path);
     g_status = "bonanza-v6 fv.bin loaded from " + (abs_path.empty() ? path : abs_path) + " [" + tag
              + "] [family=BONANZA_V6_FV] [size=" + std::to_string(static_cast<long long>(size))
-             + " bytes] [fv_scale=" + std::to_string(static_cast<long long>(FV_SCALE)) + "]";
+             + " bytes] [fv_scale=" + std::to_string(static_cast<long long>(g_fv_scale)) + "]";
     g_family = EvalFamily::BONANZA_V6_FV;
     return true;
 }
@@ -531,13 +680,11 @@ void try_load_eval_file_once() {
     if (g_loaded_once) return;
     g_loaded_once = true;
 
-    // Priority 1: explicit setoption / set_eval_file_path
     if (g_explicit_path && !g_eval_file_path.empty()) {
         try_load_from_path(g_eval_file_path, /*is_auto=*/false);
         return;
     }
 
-    // Priority 2: environment variable (explicit but lower than setoption)
     {
         const char* env_path = std::getenv("SHOGIAI_EVAL_FILE");
         if (env_path && *env_path) {
@@ -546,19 +693,12 @@ void try_load_eval_file_once() {
         }
     }
 
-    // Priority 3: auto-discovery. Candidates are recomputed on every call
-    // (see build_discovery_candidates()) so they reflect the executable's
-    // own location and the current working directory, in that priority
-    // order, rather than only ever checking two fixed cwd-relative paths.
     const std::vector<std::string> candidates = build_discovery_candidates();
     for (const std::string& candidate : candidates) {
         if (try_load_from_path(candidate, /*is_auto=*/true)) return;
-        // Stop discovery early if we positively identified an unsupported
-        // (NNUE-looking) file at this candidate path.
         if (g_family == EvalFamily::NNUE_UNSUPPORTED) return;
     }
 
-    // Priority 4: built-in material fallback
     std::string checked;
     for (size_t i = 0; i < candidates.size(); ++i) {
         if (i) checked += ", ";
@@ -576,12 +716,30 @@ void try_load_eval_file_once() {
 // ============================================================
 
 void set_eval_file_path(const std::string& path) {
-    g_eval_file_path  = path;
-    g_explicit_path   = !path.empty();
-    g_loaded_once     = false;
-    g_tables          = FvTables{};
-    g_status          = "material-only fallback (fv.bin missing)";
-    g_family          = EvalFamily::MATERIAL_FALLBACK;
+    g_eval_file_path = path;
+    g_explicit_path  = !path.empty();
+    g_loaded_once    = false;
+    g_tables         = FvTables{};
+    g_status         = "material-only fallback (fv.bin missing)";
+    g_family         = EvalFamily::MATERIAL_FALLBACK;
+    bump_eval_epoch();
+}
+
+void set_fv_scale(int scale) {
+    if (scale < 1) scale = 1;
+    if (scale > 256) scale = 256;
+    if (g_fv_scale != scale) {
+        g_fv_scale = scale;
+        bump_eval_epoch();
+    }
+}
+
+int get_fv_scale() {
+    return static_cast<int>(g_fv_scale);
+}
+
+void clear_eval_caches() {
+    bump_eval_epoch();
 }
 
 std::string eval_status_message() {
@@ -594,94 +752,62 @@ EvalFamily get_eval_family() {
     return g_family;
 }
 
+int evaluate_full_reference(const Board& board) {
+    try_load_eval_file_once();
+    const Color us = board.side_to_move();
+    const int material_black = board.material_black();
+
+    if (g_family != EvalFamily::BONANZA_V6_FV ||
+        board.king_sq(BLACK) == SQ_NONE || board.king_sq(WHITE) == SQ_NONE) {
+        return (us == BLACK) ? material_black : -material_black;
+    }
+
+    EvalStateEntry st;
+    build_full_eval_state(board, st);
+
+    int64_t raw = static_cast<int64_t>(material_black) * g_fv_scale
+                + st.sum_kkp + st.sum_bkpp - st.sum_wkpp;
+    if (us == WHITE) raw = -raw;
+    return static_cast<int>(raw / g_fv_scale);
+}
+
 int evaluate(const Board& board) {
     try_load_eval_file_once();
 
     const Color us = board.side_to_move();
+    const int material_black = board.material_black();
 
-    // Material term: the entire score for MATERIAL_FALLBACK, and an
-    // additive term (scaled by FV_SCALE) alongside the KKP/KPP relation
-    // terms for BONANZA_V6_FV. Computed once, from Black's point of view
-    // (positive == good for Black), matching the sign convention used by
-    // the rest of the Bonanza-formula computation below.
-    int material_black = 0;
-    for (int s = 0; s < SQUARE_NB; ++s) {
-        Piece p = board.piece_at(s);
-        if (p == NO_PIECE) continue;
-        int v = FALLBACK_PIECE_VALUE[type_of(p)];
-        material_black += (color_of(p) == BLACK) ? v : -v;
-    }
-    for (int pt = PAWN; pt <= ROOK; ++pt) {
-        int v = FALLBACK_PIECE_VALUE[pt];
-        material_black += board.hand(BLACK, static_cast<PieceType>(pt)) * v;
-        material_black -= board.hand(WHITE, static_cast<PieceType>(pt)) * v;
-    }
-
-    if (g_family != EvalFamily::BONANZA_V6_FV) {
-        // Material-only fallback (no valid fv.bin, or NNUE detected).
+    if (g_family != EvalFamily::BONANZA_V6_FV ||
+        board.king_sq(BLACK) == SQ_NONE || board.king_sq(WHITE) == SQ_NONE) {
         return (us == BLACK) ? material_black : -material_black;
     }
 
-    // Bonanza-v6 KPP/KKP evaluation. Always accumulated from Black's point
-    // of view, then negated at the very end if White is to move — exactly
-    // like genuine Bonanza (see file header comment for the exact formula
-    // and its provenance).
-    const int sq_bk     = to_bonanza_sq(board.king_sq(BLACK));
-    const int sq_wk     = to_bonanza_sq(board.king_sq(WHITE));
-    const int sq_bk_inv = mirror_sq(sq_bk);
-    const int sq_wk_inv = mirror_sq(sq_wk);
-
-    // list0: every non-king piece, expressed from Black's own point of
-    // view (own == Black uses f_*, squares unmirrored).
-    // list1: the same pieces, expressed from White's own point of view
-    // (own == White uses f_*, squares mirrored 180 degrees).
-    const std::vector<int> list0 = build_feature_list(board, BLACK);
-    const std::vector<int> list1 = build_feature_list(board, WHITE);
-
-    int64_t score = static_cast<int64_t>(material_black) * FV_SCALE;
-
-    // KKP term: exactly one lookup per non-king piece (hand or board),
-    // ADDED for Black's own pieces (looked up at the unmirrored
-    // (SQ_BKING, SQ_WKING) king pair) and SUBTRACTED for White's own
-    // pieces (looked up at the mirrored (Inv(SQ_WKING), Inv(SQ_BKING))
-    // king pair, with the board square itself also mirrored) — exactly
-    // matching genuine Bonanza's make_list() (see file header comment).
-    for (int pt = PAWN; pt <= ROOK; ++pt) {
-        const int hb = hand_kkp_base(static_cast<PieceType>(pt));
-        if (hb < 0) continue;
-        score += kkp_lookup(sq_bk, sq_wk, hb + board.hand(BLACK, static_cast<PieceType>(pt)));
-        score -= kkp_lookup(sq_wk_inv, sq_bk_inv, hb + board.hand(WHITE, static_cast<PieceType>(pt)));
+    // 1. Probe Evaluation Hash Table (O(1) hit across transpositions / qsearch / IID / PVS)
+    //    Mask out side-to-move bit so Black-to-move and White-to-move share the same Black-POV slot!
+    const uint64_t pos_key = (us == WHITE) ? (board.hash() ^ Zobrist::side) : board.hash();
+    EvalHashEntry& eh = g_ehash[pos_key & EHASH_MASK];
+    if (eh.epoch == g_eval_epoch && eh.key == pos_key) {
+        return (us == BLACK) ? eh.score_black : -eh.score_black;
     }
-    for (int s = 0; s < SQUARE_NB; ++s) {
-        const Piece p = board.piece_at(s);
-        if (p == NO_PIECE || type_of(p) == KING) continue;
-        const int bb = board_kkp_base(type_of(p));
-        if (bb < 0) continue;
-        const int bsq = to_bonanza_sq(static_cast<Square>(s));
-        if (color_of(p) == BLACK) {
-            score += kkp_lookup(sq_bk, sq_wk, bb + bsq);
-        } else {
-            score -= kkp_lookup(sq_wk_inv, sq_bk_inv, bb + mirror_sq(bsq));
+
+    // 2. Check if full state is already in `g_state_cache`, else try O(N) incremental update from parent!
+    EvalStateEntry& slot = g_state_cache[board.hash() & STATE_CACHE_MASK];
+    if (slot.epoch != g_eval_epoch || slot.key != board.hash()) {
+        EvalStateEntry next_state;
+        if (!try_incremental_eval_state(board, next_state)) {
+            build_full_eval_state(board, next_state);
         }
+        slot = next_state;
     }
 
-    // Two-piece KPP term, summed once from Black's own point of view and
-    // once from White's (mirrored) point of view, with the second pass
-    // SUBTRACTED rather than added. Every unordered pair (i, j) with
-    // i >= j is included, INCLUDING the diagonal i == j (a single-piece
-    // "self" term folded into the triangular table) — genuine Bonanza's
-    // loop is `for (j = 0; j <= i; j++)`, not `j < i`.
-    for (size_t i = 0; i < list0.size(); ++i) {
-        for (size_t j = 0; j <= i; ++j) {
-            score += kpp_lookup(sq_bk, list0[i], list0[j]);
-        }
-    }
-    for (size_t i = 0; i < list1.size(); ++i) {
-        for (size_t j = 0; j <= i; ++j) {
-            score -= kpp_lookup(sq_wk_inv, list1[i], list1[j]);
-        }
-    }
+    const int64_t raw_black = static_cast<int64_t>(material_black) * g_fv_scale
+                            + slot.sum_kkp + slot.sum_bkpp - slot.sum_wkpp;
+    // Note: in C++ integer division toward zero, `(-x) / S == -(x / S)` always holds!
+    const int score_black = static_cast<int>(raw_black / g_fv_scale);
 
-    if (us == WHITE) score = -score;
-    return static_cast<int>(score / FV_SCALE);
+    eh.key         = pos_key;
+    eh.score_black = score_black;
+    eh.epoch       = g_eval_epoch;
+
+    return (us == BLACK) ? score_black : -score_black;
 }

@@ -2,12 +2,13 @@
 #include "board.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <vector>
 
-constexpr int INF       = 1'000'000;
-constexpr int MATE_VALUE= 900'000;   // returned for checkmate/no-moves
-constexpr int MAX_DEPTH = 64;
+constexpr int INF        = 1'000'000;
+constexpr int MATE_VALUE = 900'000;   // returned for checkmate/no-moves
+constexpr int MAX_DEPTH  = 64;
 
 // Global stop flag (set by USI "stop" command or when time expires)
 extern std::atomic<bool> g_stop;
@@ -47,23 +48,40 @@ struct SearchStats {
     uint64_t exclusion_searches = 0;
 };
 
+struct TimeBudget {
+    int soft_ms = 1000;
+    int hard_ms = 1000;
+};
+
+// Configure Transposition Table size in MiB (USI_Hash option, default 64 MiB).
+void set_tt_size_mb(size_t mb);
+
+// Clear Transposition Table and all history heuristics (called on `usinewgame`).
+void search_clear_game_state();
+
 // Start the clock for a search
 void search_init_time();
 
-// Has the allocated time expired?
+// Has the allocated hard time expired?
 bool time_up(int allotted_ms);
 
-// Compute per-move time budget from remaining clock and byoyomi.
-// my_time_ms: remaining time for the side to move (milliseconds, >0).
-// byoyomi_ms: byoyomi period (milliseconds, 0 if none).
-// Returns milliseconds to allocate for this move.
+// Legacy per-move time helper (preserved for unit-test compatibility).
 int compute_allotted_ms(int my_time_ms, int byoyomi_ms);
 
-// Iterative-deepening entry point.
-// Returns the best move found within allotted_ms milliseconds.
+// YaneuraOu-style soft/hard time budget supporting btime/wtime + binc/winc + byoyomi.
+TimeBudget compute_time_budget(int my_time_ms, int my_inc_ms, int byoyomi_ms, int game_ply = 0);
+
+// Iterative-deepening entry point (fixed budget: soft == hard == allotted_ms).
 Move iterative_deepening(Board& board, int allotted_ms,
                          const std::function<void(const SearchInfo&)>& info_cb = {},
-                         const std::function<void()>& started_cb = {});
+                         const std::function<void()>& started_cb = {},
+                         int max_depth_limit = MAX_DEPTH);
+
+// Iterative-deepening entry point with separate soft (optimum) and hard (maximum) time limits.
+Move iterative_deepening_timed(Board& board, TimeBudget budget,
+                               const std::function<void(const SearchInfo&)>& info_cb = {},
+                               const std::function<void()>& started_cb = {},
+                               int max_depth_limit = MAX_DEPTH);
 
 // Single-depth negamax alpha-beta (exposed for testing)
 int negamax(Board& board, int depth, int alpha, int beta, int ply);

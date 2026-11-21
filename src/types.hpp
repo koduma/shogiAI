@@ -1,11 +1,12 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 #include <cassert>
 
 // ============================================================
 // Square
-//   sq = rank * 9 + file   (rank-major)
+//   sq = rank * 9 + file   (rank-major, identical to Bonanza A9=0 .. I1=80)
 //   file : 0..8  (0 = USI file '9' / leftmost,  8 = USI file '1' / rightmost)
 //   rank : 0..8  (0 = USI rank 'a' / top,        8 = USI rank 'i' / bottom)
 // ============================================================
@@ -15,17 +16,17 @@ constexpr int FILE_NB   = 9;
 constexpr int RANK_NB   = 9;
 constexpr int SQUARE_NB = 81;
 
-inline int    file_of  (Square s) { return s % FILE_NB; }
-inline int    rank_of  (Square s) { return s / FILE_NB; }
-inline Square make_sq  (int f, int r) { return r * FILE_NB + f; }
-inline bool   on_board (int f, int r) {
+inline constexpr int    file_of  (Square s) { return s % FILE_NB; }
+inline constexpr int    rank_of  (Square s) { return s / FILE_NB; }
+inline constexpr Square make_sq  (int f, int r) { return r * FILE_NB + f; }
+inline constexpr bool   on_board (int f, int r) {
     return static_cast<unsigned>(f) < static_cast<unsigned>(FILE_NB) &&
            static_cast<unsigned>(r) < static_cast<unsigned>(RANK_NB);
 }
 
 // USI file '1'–'9'  →  internal file 8–0
 // USI rank 'a'–'i'  →  internal rank 0–8
-inline Square usi_to_sq(char fc, char rc) {
+inline constexpr Square usi_to_sq(char fc, char rc) {
     return make_sq(FILE_NB - 1 - (fc - '1'), rc - 'a');
 }
 inline std::string sq_to_usi(Square s) {
@@ -39,7 +40,7 @@ inline std::string sq_to_usi(Square s) {
 // Color
 // ============================================================
 enum Color : int { BLACK = 0, WHITE = 1, COLOR_NB = 2 };
-inline Color operator~(Color c) { return static_cast<Color>(c ^ 1); }
+inline constexpr Color operator~(Color c) { return static_cast<Color>(c ^ 1); }
 
 // ============================================================
 // PieceType
@@ -53,7 +54,7 @@ enum PieceType : int {
     PT_NB      = 15
 };
 
-inline PieceType promote_pt(PieceType p) {
+inline constexpr PieceType promote_pt(PieceType p) {
     switch (p) {
         case PAWN:   return PROM_PAWN;
         case LANCE:  return PROM_LANCE;
@@ -64,7 +65,7 @@ inline PieceType promote_pt(PieceType p) {
         default:     return p;
     }
 }
-inline PieceType unpromote_pt(PieceType p) {
+inline constexpr PieceType unpromote_pt(PieceType p) {
     switch (p) {
         case PROM_PAWN:   return PAWN;
         case PROM_LANCE:  return LANCE;
@@ -75,18 +76,35 @@ inline PieceType unpromote_pt(PieceType p) {
         default:          return p;
     }
 }
-inline bool is_promoted   (PieceType p) { return p >= PROM_PAWN; }
+inline constexpr bool is_promoted   (PieceType p) { return p >= PROM_PAWN; }
 // Can this (unpromoted) type be promoted?  Gold and King cannot.
-inline bool is_promotable (PieceType p) { return p >= PAWN && p <= ROOK && p != GOLD && p != KING; }
+inline constexpr bool is_promotable (PieceType p) { return p >= PAWN && p <= ROOK && p != GOLD && p != KING; }
 // Base piece type used for hand storage (strips promotion)
-inline PieceType to_hand_pt(PieceType p) { return is_promoted(p) ? unpromote_pt(p) : p; }
+inline constexpr PieceType to_hand_pt(PieceType p) { return is_promoted(p) ? unpromote_pt(p) : p; }
+
+// Bonanza 6.0 piece values (src/client/param.h)
+constexpr std::array<int, PT_NB> PIECE_VALUE_BONANZA = {
+    0, 87, 232, 257, 369, 444, 569, 642, 0, 534, 489, 510, 495, 827, 945
+};
+
+// Shogi capture swing value: capturing `pt` removes enemy `pt` and adds `to_hand_pt(pt)` to hand.
+inline constexpr int capture_swing_value(PieceType pt) {
+    return (pt == KING) ? 30000
+         : (pt <= NO_PT || pt >= PT_NB) ? 0
+         : (PIECE_VALUE_BONANZA[pt] + PIECE_VALUE_BONANZA[to_hand_pt(pt)]);
+}
+inline constexpr int promote_gain_value(PieceType pt) {
+    return is_promotable(pt) ? (PIECE_VALUE_BONANZA[promote_pt(pt)] - PIECE_VALUE_BONANZA[pt]) : 0;
+}
 
 // USI character for a base piece type (PAWN–KING)
-inline char pt_to_char(PieceType p) {
-    constexpr const char* TBL = ".PLNSGBRK";
-    return TBL[static_cast<int>(p)];
+inline constexpr char pt_to_char(PieceType p) {
+    constexpr const char TBL[] = ".PLNSGBRK";
+    const int idx = static_cast<int>(p);
+    if (idx < 0 || idx > static_cast<int>(KING)) return '?';
+    return TBL[idx];
 }
-inline PieceType char_to_pt(char c) {
+inline constexpr PieceType char_to_pt(char c) {
     switch (c) {
         case 'P': return PAWN;   case 'L': return LANCE;
         case 'N': return KNIGHT; case 'S': return SILVER;
@@ -114,9 +132,9 @@ enum Piece : int {
     PIECE_NB = 31
 };
 
-inline Color     color_of (Piece p) { return static_cast<Color>    (p >> 4); }
-inline PieceType type_of  (Piece p) { return static_cast<PieceType>(p & 0xF); }
-inline Piece make_piece(Color c, PieceType pt) {
+inline constexpr Color     color_of (Piece p) { return static_cast<Color>    (p >> 4); }
+inline constexpr PieceType type_of  (Piece p) { return static_cast<PieceType>(p & 0xF); }
+inline constexpr Piece make_piece(Color c, PieceType pt) {
     return static_cast<Piece>((c << 4) | static_cast<int>(pt));
 }
 
@@ -131,19 +149,19 @@ inline Piece make_piece(Color c, PieceType pt) {
 using Move = uint32_t;
 constexpr Move MOVE_NONE = 0u;
 
-inline Square    from_sq   (Move m) { return static_cast<Square>   ( m        & 0x7Fu); }
-inline Square    to_sq     (Move m) { return static_cast<Square>   ((m >>  7) & 0x7Fu); }
-inline bool      is_promote(Move m) { return static_cast<bool>     ((m >> 14) & 1u);   }
-inline bool      is_drop   (Move m) { return static_cast<bool>     ((m >> 15) & 1u);   }
-inline PieceType dropped_pt(Move m) { return static_cast<PieceType>((m >> 16) & 0xFu); }
+inline constexpr Square    from_sq   (Move m) { return static_cast<Square>   ( m        & 0x7Fu); }
+inline constexpr Square    to_sq     (Move m) { return static_cast<Square>   ((m >>  7) & 0x7Fu); }
+inline constexpr bool      is_promote(Move m) { return static_cast<bool>     ((m >> 14) & 1u);   }
+inline constexpr bool      is_drop   (Move m) { return static_cast<bool>     ((m >> 15) & 1u);   }
+inline constexpr PieceType dropped_pt(Move m) { return static_cast<PieceType>((m >> 16) & 0xFu); }
 
-inline Move make_normal_move (Square from, Square to) {
+inline constexpr Move make_normal_move (Square from, Square to) {
     return static_cast<Move>(static_cast<uint32_t>(from) | (static_cast<uint32_t>(to) << 7));
 }
-inline Move make_promote_move(Square from, Square to) {
+inline constexpr Move make_promote_move(Square from, Square to) {
     return static_cast<Move>(static_cast<uint32_t>(from) | (static_cast<uint32_t>(to) << 7) | (1u << 14));
 }
-inline Move make_drop_move(PieceType pt, Square to) {
+inline constexpr Move make_drop_move(PieceType pt, Square to) {
     return static_cast<Move>((1u << 15) |
                              (static_cast<uint32_t>(to) << 7) |
                              (static_cast<uint32_t>(pt) << 16));
@@ -160,6 +178,8 @@ struct MoveList {
     void  push (Move m)        { moves_[size_++] = m; }
     int   size ()        const { return size_; }
     bool  empty()        const { return size_ == 0; }
+    Move  operator[](int i) const { return moves_[i]; }
+    Move& operator[](int i)       { return moves_[i]; }
     Move* begin()              { return moves_; }
     Move* end  ()              { return moves_ + size_; }
     const Move* begin()  const { return moves_; }

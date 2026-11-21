@@ -25,7 +25,6 @@ int main() {
 
     std::string line;
     while (std::getline(std::cin, line)) {
-        // Strip trailing CR (Windows line endings)
         if (!line.empty() && line.back() == '\r') line.pop_back();
 
         std::istringstream iss(line);
@@ -41,7 +40,9 @@ int main() {
         if (cmd == "usi") {
             std::cout << "id name ShogiEngine\n";
             std::cout << "id author ShogiAI\n";
+            std::cout << "option name USI_Hash type spin default 64 min 4 max 2048\n";
             std::cout << "option name EvalFile type string default eval/fv.bin\n";
+            std::cout << "option name FV_SCALE type spin default 32 min 1 max 256\n";
             std::cout << "usiok\n";
             std::cout.flush();
 
@@ -65,11 +66,16 @@ int main() {
             }
             if (name == "EvalFile") {
                 set_eval_file_path(value);
+            } else if (name == "USI_Hash" && !value.empty()) {
+                try { set_tt_size_mb(static_cast<size_t>(std::stoul(value))); } catch (...) {}
+            } else if (name == "FV_SCALE" && !value.empty()) {
+                try { set_fv_scale(std::stoi(value)); } catch (...) {}
             }
 
         // ---- usinewgame ----
         } else if (cmd == "usinewgame") {
             board.set_startpos();
+            search_clear_game_state();
 
         // ---- position ----
         } else if (cmd == "position") {
@@ -79,7 +85,6 @@ int main() {
             if (type == "startpos") {
                 board.set_startpos();
             } else if (type == "sfen") {
-                // Collect the 4 SFEN fields (stop early if "moves" is encountered)
                 std::string sfen;
                 std::string tok;
                 int fields = 0;
@@ -90,19 +95,15 @@ int main() {
                     fields++;
                 }
                 board.parse_sfen(sfen);
-                // If we didn't break on "moves", read the next token
                 if (tok != "moves") iss >> tok;
-                // Apply any moves that follow
                 if (tok == "moves") {
                     std::string mv;
                     while (iss >> mv)
                         board.do_move(usi_to_move(mv));
                 }
-                // Position fully set; nothing more to do for this command.
                 continue;
             }
 
-            // For "startpos": apply optional "moves" section
             {
                 std::string moves_tok;
                 if (iss >> moves_tok && moves_tok == "moves") {
@@ -114,33 +115,36 @@ int main() {
 
         // ---- go ----
         } else if (cmd == "go") {
-            int btime = -1, wtime = -1, byoyomi = 0, movetime = -1;
+            int btime = -1, wtime = -1, binc = 0, winc = 0, byoyomi = 0, movetime = -1;
+            int depth_limit = MAX_DEPTH;
             bool infinite = false;
 
             std::string tok;
             while (iss >> tok) {
                 if      (tok == "btime"   ) iss >> btime;
                 else if (tok == "wtime"   ) iss >> wtime;
+                else if (tok == "binc"    ) iss >> binc;
+                else if (tok == "winc"    ) iss >> winc;
                 else if (tok == "byoyomi" ) iss >> byoyomi;
                 else if (tok == "movetime") iss >> movetime;
+                else if (tok == "depth"   ) iss >> depth_limit;
                 else if (tok == "infinite") infinite = true;
             }
 
-            // Time management
-            int allotted_ms;
+            TimeBudget budget;
             if (movetime > 0) {
-                allotted_ms = std::max(1, movetime - 10);  // small safety margin
+                int ms = std::max(1, movetime - 15);
+                budget = {ms, ms};
             } else if (infinite) {
-                allotted_ms = 60 * 1000;      // search for up to 60 s then return best
+                budget = {0, 0}; // run until explicit `stop` or max depth
+            } else if (btime >= 0 || wtime >= 0 || byoyomi > 0) {
+                const bool is_black = (board.side_to_move() == BLACK);
+                const int my_time = is_black ? btime : wtime;
+                const int my_inc  = is_black ? binc  : winc;
+                budget = compute_time_budget(std::max(0, my_time), std::max(0, my_inc),
+                                             std::max(0, byoyomi), board.ply_);
             } else {
-                int my_time = (board.side_to_move() == BLACK) ? btime : wtime;
-                if (my_time > 0) {
-                    allotted_ms = compute_allotted_ms(my_time, byoyomi);
-                } else if (byoyomi > 0) {
-                    allotted_ms = byoyomi * 9 / 10;
-                } else {
-                    allotted_ms = 2000;        // fallback: 2 seconds
-                }
+                budget = {1500, 2000};
             }
 
             std::cout << "info string " << eval_status_message() << "\n";
@@ -149,9 +153,9 @@ int main() {
             Board search_board = board;
             std::promise<void> started;
             std::future<void> search_started = started.get_future();
-            search_thread = std::thread([search_board = std::move(search_board), allotted_ms,
+            search_thread = std::thread([search_board = std::move(search_board), budget, depth_limit,
                                          started = std::move(started)]() mutable {
-                Move best = iterative_deepening(search_board, allotted_ms, [](const SearchInfo& info) {
+                Move best = iterative_deepening_timed(search_board, budget, [](const SearchInfo& info) {
                     std::cout << "info depth " << info.depth
                               << " seldepth " << info.seldepth
                               << " time " << info.time_ms
@@ -163,7 +167,7 @@ int main() {
                     for (Move m : info.pv) std::cout << ' ' << move_to_usi(m);
                     std::cout << "\n";
                     std::cout.flush();
-                }, [&started] { started.set_value(); });
+                }, [&started] { started.set_value(); }, depth_limit);
 
                 if (best == MOVE_NONE) {
                     std::cout << "bestmove resign\n";
@@ -183,7 +187,6 @@ int main() {
         } else if (cmd == "quit") {
             break;
         }
-        // Ignore unknown commands (USI spec says to ignore them)
     }
 
     if (search_thread.joinable()) {

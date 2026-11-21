@@ -7,8 +7,11 @@
 // Undo information saved before each do_move
 // ============================================================
 struct StateInfo {
-    Piece    captured;   // piece that was on the destination square (NO_PIECE if none)
-    uint64_t hash;       // Zobrist hash *before* the move
+    Piece    captured = NO_PIECE;    // piece on destination square before move
+    Piece    moved_piece = NO_PIECE; // piece on destination square after move
+    Move     move = MOVE_NONE;       // move executed to reach child position
+    uint64_t hash = 0;               // Zobrist hash *before* the move
+    int      material_black = 0;     // Black-perspective material *before* the move
     Color    mover = BLACK;
     bool     gave_check = false;
     bool     null_move = false;
@@ -27,14 +30,15 @@ enum class RepetitionResult : int {
 class Board {
 public:
     Piece    board_[SQUARE_NB];            // piece at each square
-    int      hand_ [COLOR_NB][PT_NB];     // hand[color][piece_type] = count
+    int      hand_ [COLOR_NB][PT_NB];      // hand[color][piece_type] = count
     Color    stm_;                         // side to move
     int      ply_;                         // half-moves played so far
-    Square   king_sq_[COLOR_NB];          // cached king positions
+    Square   king_sq_[COLOR_NB];           // cached king positions
     uint64_t hash_;                        // current Zobrist hash
+    int      material_black_;              // incremental Bonanza material (Black POV)
 
     std::vector<StateInfo> history_;       // undo stack
-    std::vector<uint64_t>  pos_hashes_;   // all hashes seen (for repetition)
+    std::vector<uint64_t>  pos_hashes_;    // all hashes seen (for repetition)
 
     Board();
 
@@ -45,20 +49,24 @@ public:
     std::string to_sfen() const;
 
     // Move execution
-    void do_move  (Move m, bool record_check = true);
-    void undo_move(Move m);
+    void do_move       (Move m, bool record_check = true);
+    void undo_move     (Move m);
+    void do_null_move  ();
+    void undo_null_move();
 
     // Queries
-    Piece    piece_at    (Square s)  const { return board_[s]; }
-    bool     is_empty    (Square s)  const { return board_[s] == NO_PIECE; }
-    Color    side_to_move()          const { return stm_; }
-    int      hand        (Color c, PieceType pt) const { return hand_[c][pt]; }
-    Square   king_sq     (Color c)   const { return king_sq_[c]; }
-    uint64_t hash        ()          const { return hash_; }
+    Piece    piece_at      (Square s)  const { return board_[s]; }
+    bool     is_empty      (Square s)  const { return board_[s] == NO_PIECE; }
+    Color    side_to_move  ()          const { return stm_; }
+    int      hand          (Color c, PieceType pt) const { return hand_[c][pt]; }
+    Square   king_sq       (Color c)   const { return king_sq_[c]; }
+    uint64_t hash          ()          const { return hash_; }
+    int      material_black()          const { return material_black_; }
 
     // Attack / check detection
-    bool is_attacked(Square sq, Color by) const;
-    bool in_check   ()                    const;
+    bool is_attacked         (Square sq, Color by) const;
+    bool is_attacked_ignoring(Square sq, Color by, Square ignore_sq) const;
+    bool in_check            () const;
 
     // Repetition
     int  repetition_count() const;
@@ -68,7 +76,7 @@ public:
     void print() const;
 
 private:
-    void compute_hash();
+    void compute_hash_and_material();
 };
 
 // ============================================================

@@ -21,6 +21,7 @@ namespace Zobrist {
     }
 
     void init() {
+        rng_state = 0xdeadbeefcafe1234ULL;
         for (int p = 0; p < PIECE_NB; p++)
             for (int s = 0; s < SQUARE_NB; s++)
                 piece_sq[p][s] = rng64();
@@ -39,14 +40,19 @@ namespace Zobrist {
 // ============================================================
 // Board constructor / reset
 // ============================================================
-Board::Board() { reset(); }
+Board::Board() {
+    history_.reserve(256);
+    pos_hashes_.reserve(512);
+    reset();
+}
 
 void Board::reset() {
     std::memset(board_, 0, sizeof(board_));
     std::memset(hand_,  0, sizeof(hand_));
-    stm_  = BLACK;
-    ply_  = 0;
-    hash_ = 0;
+    stm_            = BLACK;
+    ply_            = 0;
+    hash_           = 0;
+    material_black_ = 0;
     king_sq_[BLACK] = SQ_NONE;
     king_sq_[WHITE] = SQ_NONE;
     history_.clear();
@@ -54,17 +60,30 @@ void Board::reset() {
 }
 
 // ============================================================
-// Zobrist hash recomputation from scratch
+// Zobrist hash & material recomputation from scratch
 // ============================================================
-void Board::compute_hash() {
+void Board::compute_hash_and_material() {
     hash_ = 0;
+    material_black_ = 0;
     for (int s = 0; s < SQUARE_NB; s++) {
-        if (board_[s] != NO_PIECE)
-            hash_ ^= Zobrist::piece_sq[board_[s]][s];
+        Piece p = board_[s];
+        if (p != NO_PIECE) {
+            hash_ ^= Zobrist::piece_sq[p][s];
+            int v = PIECE_VALUE_BONANZA[type_of(p)];
+            material_black_ += (color_of(p) == BLACK) ? v : -v;
+        }
     }
-    for (int c = 0; c < COLOR_NB; c++)
-        for (int pt = 0; pt < PT_NB; pt++)
-            hash_ ^= Zobrist::hand[c][pt][hand_[c][pt]];
+    for (int c = 0; c < COLOR_NB; c++) {
+        for (int pt = 0; pt < PT_NB; pt++) {
+            int cnt = hand_[c][pt];
+            if (cnt >= 0 && cnt <= Zobrist::MAX_HAND)
+                hash_ ^= Zobrist::hand[c][pt][cnt];
+            if (pt >= PAWN && pt <= ROOK && cnt != 0) {
+                int v = PIECE_VALUE_BONANZA[pt] * cnt;
+                material_black_ += (c == BLACK) ? v : -v;
+            }
+        }
+    }
     if (stm_ == WHITE)
         hash_ ^= Zobrist::side;
 }
@@ -133,7 +152,7 @@ bool Board::parse_sfen(const std::string& sfen) {
         } catch (...) {}
     }
 
-    compute_hash();
+    compute_hash_and_material();
     pos_hashes_.push_back(hash_);
     return true;
 }
@@ -191,22 +210,25 @@ std::string Board::to_sfen() const {
 }
 
 // ============================================================
-// do_move
+// do_move / undo_move / null_move
 // ============================================================
 void Board::do_move(Move m, bool record_check) {
     StateInfo si;
-    si.hash     = hash_;
-    si.captured = NO_PIECE;
+    si.hash           = hash_;
+    si.material_black = material_black_;
+    si.captured       = NO_PIECE;
+    si.move           = m;
 
     Color us   = stm_;
     Color them = ~us;
-    si.mover = us;
+    si.mover   = us;
+    const int sign = (us == BLACK) ? 1 : -1;
 
     if (is_drop(m)) {
         PieceType pt = dropped_pt(m);
         Square    to = to_sq(m);
 
-        // remove from hand – update hash
+        // remove from hand – update hash (material_black_ unchanged on drop)
         hash_ ^= Zobrist::hand[us][pt][hand_[us][pt]];
         hand_[us][pt]--;
         hash_ ^= Zobrist::hand[us][pt][hand_[us][pt]];
@@ -215,11 +237,13 @@ void Board::do_move(Move m, bool record_check) {
         Piece p = make_piece(us, pt);
         board_[to] = p;
         hash_ ^= Zobrist::piece_sq[p][to];
+        si.moved_piece = p;
     } else {
         Square from     = from_sq(m);
         Square to       = to_sq(m);
         Piece  moving   = board_[from];
         Piece  captured = board_[to];
+        PieceType orig_type = type_of(moving);
 
         si.captured = captured;
 
@@ -230,24 +254,27 @@ void Board::do_move(Move m, bool record_check) {
         // handle capture
         if (captured != NO_PIECE) {
             hash_ ^= Zobrist::piece_sq[captured][to];
-            PieceType cap_base = to_hand_pt(type_of(captured));
+            PieceType cap_pt   = type_of(captured);
+            PieceType cap_base = to_hand_pt(cap_pt);
             hash_ ^= Zobrist::hand[us][cap_base][hand_[us][cap_base]];
             hand_[us][cap_base]++;
             hash_ ^= Zobrist::hand[us][cap_base][hand_[us][cap_base]];
+            material_black_ += sign * (PIECE_VALUE_BONANZA[cap_pt] + PIECE_VALUE_BONANZA[cap_base]);
         }
 
         // handle promotion
         if (is_promote(m)) {
-            moving = make_piece(us, promote_pt(type_of(moving)));
+            PieceType prom_type = promote_pt(orig_type);
+            moving = make_piece(us, prom_type);
+            material_black_ += sign * (PIECE_VALUE_BONANZA[prom_type] - PIECE_VALUE_BONANZA[orig_type]);
         }
 
         // place on destination
         board_[to] = moving;
         hash_ ^= Zobrist::piece_sq[moving][to];
+        si.moved_piece = moving;
 
-        // Update king position cache.
-        // Recover the original piece type (before promotion) to identify king moves.
-        PieceType orig_type = is_promote(m) ? unpromote_pt(type_of(moving)) : type_of(moving);
+        // Update king position cache
         if (orig_type == KING) king_sq_[us] = to;
     }
 
@@ -261,20 +288,18 @@ void Board::do_move(Move m, bool record_check) {
     pos_hashes_.push_back(hash_);
 }
 
-// ============================================================
-// undo_move
-// ============================================================
 void Board::undo_move(Move m) {
-    Color them = stm_;         // side that WILL move next (= side that just moved = ~them below)
-    Color us   = ~them;        // side that made the move we are undoing
+    Color them = stm_;
+    Color us   = ~them;
 
     stm_  = us;
     ply_--;
 
-    StateInfo si = history_.back();
+    const StateInfo si = history_.back();
     history_.pop_back();
     pos_hashes_.pop_back();
-    hash_ = si.hash;  // restore hash wholesale
+    hash_           = si.hash;
+    material_black_ = si.material_black;
 
     if (is_drop(m)) {
         PieceType pt = dropped_pt(m);
@@ -286,20 +311,16 @@ void Board::undo_move(Move m) {
         Square from = from_sq(m);
         Square to   = to_sq(m);
 
-        Piece    moved_now  = board_[to];
+        Piece     moved_now  = board_[to];
         PieceType moved_type = type_of(moved_now);
 
-        // undo promotion
         if (is_promote(m)) moved_type = unpromote_pt(moved_type);
 
-        // restore piece at source
         board_[from] = make_piece(us, moved_type);
         if (moved_type == KING) king_sq_[us] = from;
 
-        // restore destination
         board_[to] = si.captured;
 
-        // remove captured piece from hand
         if (si.captured != NO_PIECE) {
             PieceType cap_base = to_hand_pt(type_of(si.captured));
             hand_[us][cap_base]--;
@@ -307,140 +328,149 @@ void Board::undo_move(Move m) {
     }
 }
 
+void Board::do_null_move() {
+    StateInfo si;
+    si.hash           = hash_;
+    si.material_black = material_black_;
+    si.mover          = stm_;
+    si.null_move      = true;
+
+    stm_  = ~stm_;
+    hash_ ^= Zobrist::side;
+    ply_++;
+    history_.push_back(si);
+    pos_hashes_.push_back(hash_);
+}
+
+void Board::undo_null_move() {
+    const StateInfo si = history_.back();
+    history_.pop_back();
+    pos_hashes_.pop_back();
+    ply_--;
+    hash_           = si.hash;
+    material_black_ = si.material_black;
+    stm_            = ~stm_;
+}
+
 // ============================================================
-// is_attacked(sq, by)
-//   Returns true if any piece of color 'by' can capture on square 'sq'.
+// is_attacked_ignoring(sq, by, ignore_sq)
+//   Returns true if any piece of color 'by' attacks 'sq',
+//   treating 'ignore_sq' as empty (used for king-move legality).
 // ============================================================
-bool Board::is_attacked(Square sq, Color by) const {
+bool Board::is_attacked_ignoring(Square sq, Color by, Square ignore_sq) const {
+    if (sq < 0 || sq >= SQUARE_NB) return false;
     const int f   = file_of(sq);
     const int r   = rank_of(sq);
-    const int fwd = (by == BLACK) ? -1 : 1;   // rank-delta for 'by's forward
+    const int fwd = (by == BLACK) ? -1 : 1;
 
     // ---- Pawn ----
-    // by's pawn at (f, r - fwd) attacks sq by moving forward (+fwd).
     {
         int pr = r - fwd;
         if (on_board(f, pr)) {
-            Piece p = board_[make_sq(f, pr)];
-            if (p == make_piece(by, PAWN)) return true;
-        }
-    }
-
-    // ---- Lance (sliding forward) ----
-    // by's lance attacks from behind sq (in the -fwd direction from sq).
-    {
-        for (int nr = r - fwd; on_board(f, nr); nr -= fwd) {
-            Piece p = board_[make_sq(f, nr)];
-            if (p != NO_PIECE) {
-                if (p == make_piece(by, LANCE)) return true;
-                break;
-            }
+            Square s = make_sq(f, pr);
+            if (s != ignore_sq && board_[s] == make_piece(by, PAWN)) return true;
         }
     }
 
     // ---- Knight ----
-    // by's knight at (f ± 1, r - 2*fwd) attacks sq.
     for (int df : {-1, 1}) {
         int nf = f + df, nr = r - 2 * fwd;
-        if (on_board(nf, nr) && board_[make_sq(nf, nr)] == make_piece(by, KNIGHT))
-            return true;
-    }
-
-    // ---- Silver ----
-    // Positions where by's silver can be to attack sq:
-    //   (f,    r - fwd),   (f±1, r - fwd),   (f±1, r + fwd)
-    {
-        Piece sv = make_piece(by, SILVER);
-        auto chk = [&](int df, int dr) {
-            int nf = f+df, nr = r+dr;
-            return on_board(nf,nr) && board_[make_sq(nf,nr)] == sv;
-        };
-        if (chk( 0, -fwd) || chk( 1, -fwd) || chk(-1, -fwd) ||
-            chk( 1,  fwd) || chk(-1,  fwd)) return true;
-    }
-
-    // ---- Gold & gold-equivalent promoted pieces ----
-    // Positions: (f, r-fwd), (f±1, r-fwd), (f±1, r), (f, r+fwd)
-    {
-        auto is_gold_mover = [&](Piece p) -> bool {
-            if (p == NO_PIECE || color_of(p) != by) return false;
-            PieceType t = type_of(p);
-            return t == GOLD || t == PROM_PAWN || t == PROM_LANCE ||
-                   t == PROM_KNIGHT || t == PROM_SILVER;
-        };
-        int cks[6][2] = {{0,-fwd},{1,-fwd},{-1,-fwd},{1,0},{-1,0},{0,fwd}};
-        for (auto& ck : cks) {
-            int nf = f+ck[0], nr = r+ck[1];
-            if (on_board(nf,nr) && is_gold_mover(board_[make_sq(nf,nr)])) return true;
+        if (on_board(nf, nr)) {
+            Square s = make_sq(nf, nr);
+            if (s != ignore_sq && board_[s] == make_piece(by, KNIGHT)) return true;
         }
     }
 
-    // ---- Bishop / Promoted-Bishop (diagonal sliding) ----
-    // Promoted-bishop also has a 1-step orthogonal move (caught in rook scan below).
+    // ---- Silver / Gold / Promoted minors / King (adjacent 8 squares) ----
+    const Piece by_silver = make_piece(by, SILVER);
+    const Piece by_king   = make_piece(by, KING);
+    for (int dr = -1; dr <= 1; ++dr) {
+        int nr = r + dr;
+        if (static_cast<unsigned>(nr) >= static_cast<unsigned>(RANK_NB)) continue;
+        for (int df = -1; df <= 1; ++df) {
+            if (df == 0 && dr == 0) continue;
+            int nf = f + df;
+            if (static_cast<unsigned>(nf) >= static_cast<unsigned>(FILE_NB)) continue;
+            Square s = make_sq(nf, nr);
+            if (s == ignore_sq) continue;
+            Piece p = board_[s];
+            if (p == NO_PIECE || color_of(p) != by) continue;
+            if (p == by_king) return true;
+            PieceType t = type_of(p);
+            if (p == by_silver) {
+                // Silver at (f+df, r+dr) attacks (f, r) iff dr == -fwd or (df != 0 && dr == fwd)
+                if (dr == -fwd || (df != 0 && dr == fwd)) return true;
+            } else if (t == GOLD || t == PROM_PAWN || t == PROM_LANCE ||
+                       t == PROM_KNIGHT || t == PROM_SILVER) {
+                // Gold-mover at (f+df, r+dr) attacks (f, r) iff not (df != 0 && dr == fwd)
+                if (!(df != 0 && dr == fwd)) return true;
+            } else if (t == PROM_BISHOP) {
+                if (df == 0 || dr == 0) return true;
+            } else if (t == PROM_ROOK) {
+                if (df != 0 && dr != 0) return true;
+            }
+        }
+    }
+
+    // ---- Diagonal sliders (Bishop / Promoted Bishop) ----
     {
-        const int DDF[] = { 1,  1, -1, -1};
-        const int DDR[] = { 1, -1,  1, -1};
+        static constexpr int DDF[4] = { 1,  1, -1, -1};
+        static constexpr int DDR[4] = { 1, -1,  1, -1};
         for (int i = 0; i < 4; i++) {
-            bool first = true;
-            for (int nf = f+DDF[i], nr = r+DDR[i]; on_board(nf,nr);
+            for (int nf = f + DDF[i], nr = r + DDR[i]; on_board(nf, nr);
                  nf += DDF[i], nr += DDR[i]) {
-                Piece p = board_[make_sq(nf,nr)];
+                Square s = make_sq(nf, nr);
+                if (s == ignore_sq) continue;
+                Piece p = board_[s];
                 if (p != NO_PIECE) {
                     if (color_of(p) == by) {
                         PieceType t = type_of(p);
                         if (t == BISHOP || t == PROM_BISHOP) return true;
-                        // Prom-Rook can step 1 diagonal
-                        if (first && t == PROM_ROOK) return true;
                     }
                     break;
                 }
-                first = false;
             }
         }
     }
 
-    // ---- Rook / Promoted-Rook (orthogonal sliding) ----
-    // Promoted-rook also has a 1-step diagonal move (caught in bishop scan above).
+    // ---- Orthogonal sliders (Rook / Promoted Rook / Lance) ----
     {
-        const int ODF[] = { 1, -1,  0,  0};
-        const int ODR[] = { 0,  0,  1, -1};
+        static constexpr int ODF[4] = { 1, -1,  0,  0};
+        static constexpr int ODR[4] = { 0,  0,  1, -1};
         for (int i = 0; i < 4; i++) {
-            bool first = true;
-            for (int nf = f+ODF[i], nr = r+ODR[i]; on_board(nf,nr);
+            const bool lance_ray = (ODF[i] == 0 && ODR[i] == -fwd);
+            for (int nf = f + ODF[i], nr = r + ODR[i]; on_board(nf, nr);
                  nf += ODF[i], nr += ODR[i]) {
-                Piece p = board_[make_sq(nf,nr)];
+                Square s = make_sq(nf, nr);
+                if (s == ignore_sq) continue;
+                Piece p = board_[s];
                 if (p != NO_PIECE) {
                     if (color_of(p) == by) {
                         PieceType t = type_of(p);
                         if (t == ROOK || t == PROM_ROOK) return true;
-                        // Prom-Bishop can step 1 orthogonal
-                        if (first && t == PROM_BISHOP) return true;
+                        if (lance_ray && t == LANCE) return true;
                     }
                     break;
                 }
-                first = false;
             }
         }
-    }
-
-    // ---- King ----
-    for (int df = -1; df <= 1; df++) for (int dr = -1; dr <= 1; dr++) {
-        if (df == 0 && dr == 0) continue;
-        int nf = f+df, nr = r+dr;
-        if (on_board(nf,nr) && board_[make_sq(nf,nr)] == make_piece(by, KING))
-            return true;
     }
 
     return false;
 }
 
+bool Board::is_attacked(Square sq, Color by) const {
+    return is_attacked_ignoring(sq, by, SQ_NONE);
+}
+
 bool Board::in_check() const {
-    return is_attacked(king_sq_[stm_], ~stm_);
+    Square ksq = king_sq_[stm_];
+    if (ksq == SQ_NONE) return false;
+    return is_attacked(ksq, ~stm_);
 }
 
 // ============================================================
-// repetition_count
-//   Count how many times the current position has appeared.
+// repetition_count / repetition_result
 // ============================================================
 int Board::repetition_count() const {
     int cnt = 0;
@@ -504,7 +534,7 @@ void Board::print() const {
             bool prom = is_promoted(pt);
             if (prom) pt = unpromote_pt(pt);
             char ch = pt_to_char(pt);
-            if (prom) ch = static_cast<char>(std::tolower(ch)); // lowercase = promoted
+            if (prom) ch = static_cast<char>(std::tolower(ch));
             if (color_of(p) == BLACK) ch = static_cast<char>(std::toupper(ch));
             std::cout << ch << ' ';
         }
@@ -531,12 +561,10 @@ std::string move_to_usi(Move m) {
 
 Move usi_to_move(const std::string& s) {
     if (s.size() >= 4 && s[1] == '*') {
-        // Drop: "P*5e"
         PieceType pt = char_to_pt(static_cast<char>(std::toupper(s[0])));
         Square    to = usi_to_sq(s[2], s[3]);
         return make_drop_move(pt, to);
     }
-    // Normal / promote: "7g7f" or "7g7f+"
     Square from  = usi_to_sq(s[0], s[1]);
     Square to    = usi_to_sq(s[2], s[3]);
     bool   promo = (s.size() >= 5 && s[4] == '+');
