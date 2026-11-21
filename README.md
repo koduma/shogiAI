@@ -24,6 +24,9 @@ g++ -std=c++17 -O3 -march=native -Wall -Wextra src/main.cpp src/board.cpp src/mo
 
 # Windows (MinGW-w64)
 g++ -std=c++17 -O3 -march=native -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -lpthread -o shogi_engine.exe
+
+g++ -std=c++17 -O3 -mavx2 -mfma -mbmi2 -mpopcnt -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -static -lpthread -o shogi_engine.exe
+
 ```
 
 ### CMake ビルド（デフォルトで Release `-O3` および `-march=native` 自動検出が有効）
