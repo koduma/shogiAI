@@ -41,14 +41,16 @@ int main() {
             std::cout << "id name ShogiEngine\n";
             std::cout << "id author ShogiAI\n";
             std::cout << "option name USI_Hash type spin default 64 min 4 max 2048\n";
-            std::cout << "option name EvalFile type string default eval/fv.bin\n";
-            std::cout << "option name FV_SCALE type spin default 32 min 1 max 256\n";
+            std::cout << "option name EvalDir type string default eval\n";
+            std::cout << "option name EvalFile type string default eval/nn.bin\n";
+            std::cout << "option name ProgressFile type string default eval/progress.bin\n";
+            std::cout << "option name FV_SCALE type spin default 24 min 1 max 256\n";
             std::cout << "usiok\n";
             std::cout.flush();
 
         // ---- isready ----
         } else if (cmd == "isready") {
-            (void)eval_status_message();
+            std::cout << "info string " << eval_status_message() << "\n";
             std::cout << "readyok\n";
             std::cout.flush();
 
@@ -64,8 +66,12 @@ int main() {
                 if (!value.empty()) value += ' ';
                 value += tok;
             }
-            if (name == "EvalFile") {
+            if (name == "EvalDir") {
+                set_eval_dir(value);
+            } else if (name == "EvalFile") {
                 set_eval_file_path(value);
+            } else if (name == "ProgressFile") {
+                set_progress_file_path(value);
             } else if (name == "USI_Hash" && !value.empty()) {
                 try { set_tt_size_mb(static_cast<size_t>(std::stoul(value))); } catch (...) {}
             } else if (name == "FV_SCALE" && !value.empty()) {
@@ -141,8 +147,9 @@ int main() {
                 const bool is_black = (board.side_to_move() == BLACK);
                 const int my_time = is_black ? btime : wtime;
                 const int my_inc  = is_black ? binc  : winc;
+                const double prog = evaluate_progress(board);
                 budget = compute_time_budget(std::max(0, my_time), std::max(0, my_inc),
-                                             std::max(0, byoyomi), board.ply_);
+                                             std::max(0, byoyomi), board.ply_, prog);
             } else {
                 budget = {1500, 2000};
             }

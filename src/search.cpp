@@ -46,7 +46,7 @@ struct TTEntry {
 };
 static_assert(sizeof(TTEntry) == 16, "TTEntry must be 16 bytes");
 
-struct alignas(64) TTCluster {
+struct alignas(16) TTCluster {
     TTEntry entry[4];
 };
 static_assert(sizeof(TTCluster) == 64, "TTCluster must fit one 64-byte cache line");
@@ -234,12 +234,21 @@ void decay_histories_for_new_search() {
 
 void reset_search_state(int hard_ms, bool decay_hist) {
     static bool lmr_initialized = false;
+    static uint32_t last_eval_cfg_epoch = 0;
     if (!lmr_initialized) {
         init_lmr_table();
         lmr_initialized = true;
     }
     ensure_tt_initialized();
     ensure_history_initialized();
+    const uint32_t cur_eval_cfg_epoch = get_eval_config_epoch();
+    if (last_eval_cfg_epoch != cur_eval_cfg_epoch) {
+        if (last_eval_cfg_epoch != 0) {
+            std::fill(g_tt.begin(), g_tt.end(), TTCluster{});
+            g_tt_gen = 1;
+        }
+        last_eval_cfg_epoch = cur_eval_cfg_epoch;
+    }
 
     search_init_time();
     g_stop.store(false, std::memory_order_relaxed);
@@ -1268,7 +1277,8 @@ int compute_allotted_ms(int my_time_ms, int byoyomi_ms) {
     return v;
 }
 
-TimeBudget compute_time_budget(int my_time_ms, int my_inc_ms, int byoyomi_ms, int game_ply) {
+TimeBudget compute_time_budget(int my_time_ms, int my_inc_ms, int byoyomi_ms,
+                               int game_ply, double game_progress) {
     constexpr int SAFETY_MS = 50;
     if (my_time_ms <= 0 && byoyomi_ms > 0) {
         int hard = std::max(20, std::min(byoyomi_ms - SAFETY_MS, byoyomi_ms * 92 / 100));
@@ -1278,9 +1288,21 @@ TimeBudget compute_time_budget(int my_time_ms, int my_inc_ms, int byoyomi_ms, in
         return {1500, 2000};
     }
 
-    const int mtg = std::max(24, 44 - game_ply / 6);
+    int mtg = std::max(24, 44 - game_ply / 6);
+    double phase_boost = 1.0;
+    if (game_progress >= 0.0 && game_progress <= 1.0) {
+        // Use learned KP progress (`progress.bin`) to estimate remaining moves and invest
+        // extra thinking time in critical midgame/early-endgame transitions (0.20..0.75).
+        const int prog_mtg = std::clamp(static_cast<int>(std::round(20.0 + 28.0 * (1.0 - game_progress))), 20, 48);
+        mtg = (mtg + prog_mtg) / 2;
+        if (game_progress >= 0.20 && game_progress <= 0.75) {
+            phase_boost = 1.18;
+        }
+    }
+
+    // Note: `my_inc_ms` is added AFTER the move, so `avail` strictly caps against current clock!
     const int avail = std::max(20, my_time_ms + byoyomi_ms - SAFETY_MS);
-    int soft = my_time_ms / mtg + my_inc_ms * 3 / 4 + byoyomi_ms * 2 / 3;
+    int soft = static_cast<int>((my_time_ms / mtg + my_inc_ms * 3 / 4 + byoyomi_ms * 2 / 3) * phase_boost);
     int hard = std::min(avail, std::max(soft * 3, my_time_ms / 8 + byoyomi_ms * 9 / 10));
     soft = std::clamp(soft, 20, hard);
     return {soft, hard};

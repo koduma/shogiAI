@@ -68,8 +68,10 @@ bool time_up(int allotted_ms);
 // Legacy per-move time helper (preserved for unit-test compatibility).
 int compute_allotted_ms(int my_time_ms, int byoyomi_ms);
 
-// YaneuraOu-style soft/hard time budget supporting btime/wtime + binc/winc + byoyomi.
-TimeBudget compute_time_budget(int my_time_ms, int my_inc_ms, int byoyomi_ms, int game_ply = 0);
+// YaneuraOu-style soft/hard time budget supporting btime/wtime + binc/winc + byoyomi,
+// optionally guided by learned game progress (`progress` in [0.0, 1.0]; < 0 uses ply only).
+TimeBudget compute_time_budget(int my_time_ms, int my_inc_ms, int byoyomi_ms,
+                               int game_ply = 0, double game_progress = -1.0);
 
 // Iterative-deepening entry point (fixed budget: soft == hard == allotted_ms).
 Move iterative_deepening(Board& board, int allotted_ms,

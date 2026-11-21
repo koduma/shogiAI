@@ -228,6 +228,8 @@ void Board::do_move(Move m, bool record_check) {
         PieceType pt = dropped_pt(m);
         Square    to = to_sq(m);
 
+        si.hand_cnt_before = static_cast<uint8_t>(hand_[us][pt]);
+
         // remove from hand – update hash (material_black_ unchanged on drop)
         hash_ ^= Zobrist::hand[us][pt][hand_[us][pt]];
         hand_[us][pt]--;
@@ -256,6 +258,7 @@ void Board::do_move(Move m, bool record_check) {
             hash_ ^= Zobrist::piece_sq[captured][to];
             PieceType cap_pt   = type_of(captured);
             PieceType cap_base = to_hand_pt(cap_pt);
+            si.hand_cnt_before = static_cast<uint8_t>(hand_[us][cap_base]);
             hash_ ^= Zobrist::hand[us][cap_base][hand_[us][cap_base]];
             hand_[us][cap_base]++;
             hash_ ^= Zobrist::hand[us][cap_base][hand_[us][cap_base]];
@@ -354,8 +357,6 @@ void Board::undo_null_move() {
 
 // ============================================================
 // is_attacked_ignoring(sq, by, ignore_sq)
-//   Returns true if any piece of color 'by' attacks 'sq',
-//   treating 'ignore_sq' as empty (used for king-move legality).
 // ============================================================
 bool Board::is_attacked_ignoring(Square sq, Color by, Square ignore_sq) const {
     if (sq < 0 || sq >= SQUARE_NB) return false;
@@ -398,11 +399,9 @@ bool Board::is_attacked_ignoring(Square sq, Color by, Square ignore_sq) const {
             if (p == by_king) return true;
             PieceType t = type_of(p);
             if (p == by_silver) {
-                // Silver at (f+df, r+dr) attacks (f, r) iff dr == -fwd or (df != 0 && dr == fwd)
                 if (dr == -fwd || (df != 0 && dr == fwd)) return true;
             } else if (t == GOLD || t == PROM_PAWN || t == PROM_LANCE ||
                        t == PROM_KNIGHT || t == PROM_SILVER) {
-                // Gold-mover at (f+df, r+dr) attacks (f, r) iff not (df != 0 && dr == fwd)
                 if (!(df != 0 && dr == fwd)) return true;
             } else if (t == PROM_BISHOP) {
                 if (df == 0 || dr == 0) return true;

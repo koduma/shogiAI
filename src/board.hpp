@@ -13,6 +13,7 @@ struct StateInfo {
     uint64_t hash = 0;               // Zobrist hash *before* the move
     int      material_black = 0;     // Black-perspective material *before* the move
     Color    mover = BLACK;
+    uint8_t  hand_cnt_before = 0;    // mover's hand count of dropped/captured base piece *before* move
     bool     gave_check = false;
     bool     null_move = false;
 };
