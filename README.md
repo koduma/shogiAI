@@ -1,288 +1,75 @@
 # ShogiAI
 
-A minimal, working Japanese shogi engine written in C++17, designed as a strong
-long-term foundation. It speaks the **USI** protocol so it can be connected to any
-compatible shogi GUI (Shogidroid, ShogiGUI, etc.).
+C++17 で実装された USI プロトコル対応の将棋エンジンです。Bonanza 6.0 形式の3駒関係評価関数（`fv.bin`: KPP + KKP）の差分計算と、[やねうら王 (YaneuraOu)](https://github.com/yaneurao/YaneuraOu) の探索アーキテクチャ（4-way クラスタ置換表、段階的 `MovePicker`、将棋固有の駒台スイング込み SEE、1手詰め判定、王手延長、1手/2手 Continuation History 等）を備えています。
 
----
+## 主な機能・特徴
 
-## Features
-
-| Area | What's implemented |
+| 領域 | 実装内容 |
 |---|---|
-| **Rules** | Full 9×9 board, all piece types & promotions, drops, check/checkmate detection, nifu (two-pawn) rule, pawn-drop-mate ban, forced-promotion zones |
-| **Search** | Iterative-deepening alpha-beta, bounded transposition table, quiescence search, countermove and continuation history, history-aware LMR, pruning stats, USI info output |
-| **Evaluation** | Material + compact KPP-style (King-Piece-Piece) interaction; external KPP parameter file with auto-discovery |
-| **Protocol** | USI: `usi`, `isready`, `position startpos/sfen`, `go`, `stop`, `quit` |
-| **Repetition** | Sennichite detection via Zobrist hashing (returns draw score) |
+| **ルール・合法手生成** | 9×9盤面、全駒種・成り・打ち、二歩・行き所のない駒・打ち歩詰め判定、玉との直線ピン判定による `do_move` 不要の高速合法手生成、戦術手／静かな手／静かな王手の段階別生成 |
+| **評価関数 (`fv.bin`)** | [Bonanza 6.0](https://ja.wikipedia.org/wiki/Bonanza) 生形式 `fv.bin`（`186,268,248` バイト: KPP `int16_t` + KKP `int16_t`, `FV_SCALE=32`）完全対応、差分駒割、親子局面間の KPP/KKP 差分更新（片玉移動時の片側再利用含む）、`EvalHash` キャッシュ |
+| **探索部** | 反復深化 + 非対称 Aspiration Window、PVS、64B アライン 4-way クラスタ置換表（静的評価値保存・世代管理）、段階的 `MovePicker`、SEE（静的交換評価）、1手詰め判定（`mate1ply`）、王手延長・Singular Extension（Multi-Cut 付き）、IIR・RFP・Razoring・検証付き NMP・Futility・LMP・SEE 枝刈り・履歴連動 LMR、静止探索初手の安全な王手生成 |
+| **学習履歴・順序付け** | 手番別 Main/Drop History、Capture History、Countermove、1-ply & 2-ply Continuation History |
+| **USI・時間管理** | `usi`, `isready`, `setoption` (`EvalFile`, `USI_Hash`, `FV_SCALE`), `usinewgame`, `position`, `go` (`btime`/`wtime`/`binc`/`winc`/`byoyomi`/`movetime`/`depth`/`infinite`), `stop`, `quit`、最善手安定度に応じたソフト／ハード時間制御 |
 
----
+## ビルド方法
 
-## Building
-
-### g++ command
-g++ -std=c++17 -O2 -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -o shogi_engine.exe
-
-
-### Requirements
-- CMake ≥ 3.14
-- A C++17-capable compiler (GCC ≥ 7, Clang ≥ 5, MSVC 2017+)
-
-### Steps
+### g++ 直接ビルド（Windows / Linux / macOS）
 
 ```bash
-# 1. Clone and enter the repository
-git clone https://github.com/koduma/shogiAI.git
-cd shogiAI
+# Linux / macOS
+g++ -std=c++17 -O3 -Wall -Wextra src/main.cpp src/board.cpp src/movegen.cpp src/eval.cpp src/search.cpp -Isrc -lpthread -o shogi_engine
 
-# 2. Configure
+# Windows (MinGW-w64)
+g++ -std=c++17 -O3 -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -lpthread -o shogi_engine.exe
+```
+
+### CMake ビルド（デフォルトで Release `-O3` が適用されます）
+
+```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 
-# 3. Build
-cmake --build build
-
-# 4. (Optional) Run tests
-cmake --build build && ./build/shogi_tests
+# 単体テスト（Perft・差分評価一致検証・SEE・詰み探索含む）
+./build/shogi_tests
 ```
 
-The build produces two binaries inside `build/`:
+## 評価関数ファイル（Bonanza 6.0 `fv.bin`）の配置
 
-| Binary | Purpose |
-|---|---|
-| `shogi_engine` | USI engine (connect to a GUI or run interactively) |
-| `shogi_tests`  | Unit-test suite |
+リポジトリ同梱の `src/eval/fv.bin` は **1バイトのダミーファイル** です。お手元の本物の Bonanza 6.0 `fv.bin`（`186,268,248` バイト ≒ 177.6 MiB / 186.3 MB）を以下のいずれかで指定してください：
 
----
+1. `src/eval/fv.bin`（または実行ファイル横の `eval/fv.bin`）に上書き配置（自動検出）
+2. USI オプション `setoption name EvalFile value /path/to/fv.bin` で指定
+3. 環境変数 `SHOGIAI_EVAL_FILE=/path/to/fv.bin` で指定
 
-## Running
+### `fv.bin` バイナリ構造と座標・添字仕様
 
-### Interactive USI session
-
-```
-$ ./build/shogi_engine
-usi
-id name ShogiEngine
-id author ShogiAI
-usiok
-isready
-readyok
-position startpos
-go movetime 2000
-info depth 1 seldepth 1 time 5 nodes 1234 nps 246800 score cp 12 pv 7g7f
-info depth 2 seldepth 4 time 19 nodes 9650 nps 507894 score cp 25 pv 7g7f 3c3d
-bestmove 7g7f
-quit
-```
-
-### Connecting to a GUI (e.g. ShogiGUI on Windows)
-
-1. Open **Tool → Engines → Add**.
-2. Point it at the `shogi_engine` binary.
-3. Start a game — the engine will respond to `go` commands automatically.
-4. 読み筋/評価値表示を有効化したい場合は、ShogiGUI のエンジン情報欄で USI `info` 行を表示してください
-   （本エンジンは `depth` / `seldepth` / `time` / `nodes` / `nps` / `score cp|mate` / `pv` を出力します）。
-
-#### Time management notes (ShogiGUI / Windows)
-
-- Leave **usi_ponder** unchecked (☐ False) — ponder is not implemented.
-- The engine uses approximately **1/40 of remaining time per move, capped at 5 seconds**.
-  For a 10-minute game this means at most ~5 s per move, so time-outs should not occur.
-- For very short time controls (e.g. 10-second byoyomi), the engine uses 90 % of
-  the byoyomi period, leaving a small safety margin.
-- `go movetime N` is also supported; the engine will return within roughly `N` ms.
-
----
-
-## 評価関数ファイル（Bonanza 6.0 fv.bin / 3駒関係評価）
-
-### 概要
-
-本エンジンは「Bonanza 6.0 形式の fv.bin」を読み込む、本格的な3駒関係評価関数
-（KPP: King-Piece-Piece / KKP: King-King-Piece / KK / KP テーブル）に対応しています。
-
-> **重要な注意**
-> リポジトリ同梱の `src/eval/fv.bin` は **1バイトのダミーファイル** です。
-> 実際に評価関数を有効化するには、ユーザーが手元に持っている
-> **Bonanza 6.0 の本物の fv.bin（bonanza_v6.0.zip 由来、無改変）** を
-> `src/eval/fv.bin` に上書き配置するか、`setoption` / 環境変数で別の場所を指定してください。
-> 170MB 前後になる本物の fv.bin は本リポジトリには含まれておらず、含める予定もありません
-> （Git に巨大バイナリを追加しない方針のため）。
-> 評価ファイルはランタイムにネットワークからダウンロードしません。
-
----
-
-### fv.bin のフォーマット（実装の根拠）
-
-このエンジンが期待するバイト列は、**推測ではなく** 実在する Bonanza→Apery 変換ツール
-（[HiraokaTakuya/apery](https://github.com/HiraokaTakuya/apery) の
-`utils/bonanzatoapery/main.cpp`）が実際に読み込んでいる、本物の Bonanza 6 fv.bin の構造を
-そのまま踏襲しています。具体的には、以下の4つのテーブルをこの順番で連結したバイナリです：
+本エンジンは [Bonanza](https://github.com/ianfab/bonanza) の `src/client/ini.c` (`load_fv`) および `src/client/shogi.h` / `evaluate.c`（解説: [やねうら王「30分でBonanzaの評価関数の要点を話します！」](https://yaneuraou.yaneu.com/2015/11/02/30%E5%88%86%E3%81%A7bonanza%E3%81%AE%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0%E3%81%AE%E8%A6%81%E7%82%B9%E3%82%92%E8%A9%B1%E3%81%97%E3%81%BE%E3%81%99%EF%BC%81/)）そのままの構造を読み込みます：
 
 | # | テーブル | 型 | 要素数 | バイト数 |
 |---|---|---|---|---|
-| 1 | KPP（王・駒・駒の3駒関係） | `int16_t` | `81 × pos_n`（`pos_n = fe_end×(fe_end+1)/2`） | 176,584,212 (~168.4 MiB) |
-| 2 | KKP（王・王・駒） | `int32_t` | `81 × 81 × fe_end` | 38,736,144 (~36.9 MiB) |
-| 3 | KK（王・王） | `int32_t` | `81 × 81` | 26,244 |
-| 4 | KP（王・駒） | `int32_t` | `81 × fe_end` | 478,224 |
+| 1 | KPP（玉・駒・駒） | `int16_t` | `81 × 1,090,026` (`fe_end = 1476` 三角配列) | 176,584,212 |
+| 2 | KKP（玉・玉・駒） | `int16_t` | `81 × 81 × 738` (`kkp_end = 738`) | 9,684,036 |
+| **合計** | | | | **186,268,248 bytes** |
 
-ここで `fe_end = 1476`（Bonanza の特徴量空間のサイズ。持ち駒 90 + 盤上駒 14種×81マス）。
-**合計 215,824,824 バイト（約205.8 MiB）** がこのエンジンが要求する fv.bin の正確なサイズです。
-KPP テーブル単体で約168MBあるため、「手元の fv.bin はだいたい170MB」という体感とも一致します。
+* **盤面座標 (`A9=0 .. I1=80`)**: Bonanza の升番号は段優先（`rank * 9 + file`, 9一=0, 1一=8, ..., 1九=80）であり、`src/types.hpp` の `Square` と完全に一致します。
+* **持ち駒添字**: KPP では 1 枚目から `f_hand_* + 1 .. + count`（1-origin）、KKP では 0 枚を含む `kkp_hand_* + count`（0-origin）を参照します。
+* **KPP/KKP 差分計算**: 非玉移動時は変化した 1〜2 駒分の KPP 行のみ差分更新し、非捕獲の玉移動時は相手玉側の `ΣKPP` をそのまま再利用します（参考: [やねうら王「KPP差分計算の高速化」](https://yaneuraou.yaneu.com/2015/09/24/kpp%E5%B7%AE%E5%88%86%E8%A8%88%E7%AE%97%E3%81%AE%E9%AB%98%E9%80%9F%E5%8C%96bonasse%E3%81%AE%E5%8A%9F%E7%BD%AA%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6/)）。
 
-> **本サンドボックス環境での制約：** 本物の約170MBの fv.bin はこの開発環境に存在しないため、
-> 上記フォーマットに対するバイト単位の実データ検証（数値の妥当性チェック）は行えていません。
-> 検証できているのは (a) ファイルサイズ／読み込みエラーの検出ロジック、および
-> (b) 全要素ゼロの同サイズファイルを読み込んだ場合に `evaluate()` が常に 0 を返すことです。
-> 実際の重み配置後は `info string <status>` の内容（読み込み成功・サイズ不一致など）で
-> 状態を必ず確認してください。
+## USI オプション一覧
 
-評価式（3駒関係）は、着手側 `us` の視点から見た単一方向の合計として実装しています：
+| オプション名 | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `USI_Hash` | `spin` | `64` (MiB) | 4-way クラスタ置換表のメモリサイズ（4〜2048 MiB） |
+| `EvalFile` | `string` | `eval/fv.bin` | Bonanza 6.0 `fv.bin` のファイルパス |
+| `FV_SCALE` | `spin` | `32` | 評価値スケーリング除数（Bonanza 6.0 標準値は `32`） |
 
-```
-score = KK[my_king][opp_king]
-      + Σ_i KP[my_king][feature_i]
-      + Σ_i KKP[my_king][opp_king][feature_i]
-      + Σ_{i<j} KPP[my_king][feature_i][feature_j]
-```
+## 参照プロジェクト
 
-`feature_i` は玉を除く盤上・持ち駒すべての駒を、Bonanza の f_/e_（味方/敵）特徴量方式でエンコードしたものです。
-オリジナルの Bonanza/Apery が行う「相手玉視点の KPP を鏡像計算して減算する」という二重パスは実装していません
-（本物の fv.bin なしに数値的な正しさを検証できないため、意図的な簡略化です）。
-
----
-
-### 自動検出（オートディスカバリ）
-
-`setoption` や環境変数で明示指定がない場合、起動時の作業ディレクトリから以下の順に探索します：
-
-| 優先順位 | パス | 典型的なシナリオ |
-|---|---|---|
-| 1 | `src/eval/fv.bin` | リポジトリルートから実行 |
-| 2 | `eval/fv.bin` | ビルドディレクトリから実行（CMake が自動コピー） |
-
-CMake でビルドすると `src/eval/` の内容が `build/eval/` にコピーされるため、
-`./build/shogi_engine` はビルドディレクトリから正しく評価ファイルを見つけられます。
-
-**注意：** 自動検出はランタイムのダウンロードを行いません。本物の fv.bin をリポジトリの
-`src/eval/` 以下に配置してください。
-
----
-
-### 明示指定（優先順位）
-
-評価ファイルの読み込み優先順位：
-
-```
-1. setoption name EvalFile value <path>  ←最優先
-2. 環境変数 SHOGIAI_EVAL_FILE=<path>
-3. 自動検出（上記の順）
-4. 内蔵の駒割のみフォールバック（ファイルなし・不正）
-```
-
-```bash
-# 環境変数で指定する例
-SHOGIAI_EVAL_FILE=/path/to/fv.bin ./build/shogi_engine
-
-# USI setoption で指定する例（GUI から設定することが多い）
-setoption name EvalFile value /path/to/fv.bin
-```
-
-`setoption name EvalFile value ` （値を空に）すると自動検出に戻ります。
-
----
-
-### 評価ステータスメッセージ
-
-`go` コマンドの直前に `info string <status>` が出力されます：
-
-| ステータス | 意味 |
-|---|---|
-| `bonanza-v6 fv.bin loaded from <path> [explicit]` | 明示指定のファイルを読み込んだ |
-| `bonanza-v6 fv.bin loaded from <path> [auto-discovered]` | 自動検出でファイルを見つけた |
-| `material-only fallback (fv.bin missing)` | ファイルなし、駒割のみで評価 |
-| `material-only fallback (file not found: ...)` | 指定ファイルが見つからない |
-| `material-only fallback (invalid Bonanza v6 fv.bin size: got X bytes, expected Y bytes; ...)` | サイズが一致しない（ダミー fv.bin を含む） |
-| `material-only fallback (failed to read fv.bin: ...)` | 読み込み中に I/O エラー |
-| `unsupported evaluator: nnue (...)` | NNUE らしきファイルを検出、非対応 |
-
-同梱の `src/eval/fv.bin`（1バイトのダミー）は常に「サイズ不一致」メッセージとなり、
-`EvalFamily::MATERIAL_FALLBACK` にフォールバックします。
-
----
-
-### コンパクト評価 vs 本格的な3駒関係評価 vs NNUE の違い
-
-| 評価手法 | このエンジンの対応 | 説明 |
-|---|---|---|
-| **本格的な3駒関係 (KPP/KKP)**（本エンジン） | ✅ 対応（要・本物の fv.bin） | Bonanza 6.0 の fv.bin テーブルをそのまま読み込み使用 |
-| **駒割のみフォールバック** | ✅ 対応 | fv.bin が無い・不正なときの内蔵デフォルト |
-| **NNUE** | ❌ 非対応（検出のみ） | Neural Network Unified Evaluator。独自の特徴量エンコーディングとインクリメンタル計算が必要 |
-
----
-
-### 外部評価実装への参照
-
-以下は参照のみです。これらのコードやウェイトファイルは**本エンジンでは直接使用できません**（NNUE の場合）。
-
-| プロジェクト | URL | ライセンス |
-|---|---|---|
-| HiraokaTakuya/apery（Bonanza→Apery fv.bin 変換ツールを含む） | https://github.com/HiraokaTakuya/apery | GPLv3 |
-| ynasu87/nnue（将棋 NNUE の先駆的実装） | https://github.com/ynasu87/nnue | GPLv3 |
-| YaneuraOu（強豪将棋エンジン、NNUE 評価含む） | https://github.com/yaneurao/YaneuraOu | GPLv3 |
-
-> **ライセンス注意：** 上記プロジェクトは GPLv3 ライセンスです。本リポジトリは現在ライセンスを明示していません。
-> 本物の Bonanza 6.0 fv.bin を使用する場合は、Bonanza のライセンス条件をご自身で確認してください。
-
----
-
-## Project Structure
-
-```
-shogiAI/
-├── CMakeLists.txt
-├── README.md
-├── src/
-│   ├── eval/
-│   │   └── fv.bin         # Dummy placeholder (1 byte); replace with a real Bonanza 6.0 fv.bin
-│   ├── types.hpp      # Square, Color, PieceType, Piece, Move primitives
-│   ├── board.hpp      # Board class declaration + Zobrist namespace
-│   ├── board.cpp      # Board state, SFEN parse/print, do/undo move, attack detection
-│   ├── movegen.hpp    # Legal move generation interface
-│   ├── movegen.cpp    # Pseudo-legal generator + legality filter
-│   ├── eval.hpp       # Evaluation function interface + EvalFamily enum
-│   ├── eval.cpp       # Bonanza v6 fv.bin (KPP/KKP/KK/KP) evaluation, auto-discovery
-│   ├── search.hpp     # Search interface + g_stop flag
-│   ├── search.cpp     # Iterative-deepening alpha-beta + TT + quiescence
-│   └── main.cpp       # USI protocol main loop
-└── tests/
-    └── test_main.cpp  # Unit tests (no external framework required)
-```
-
----
-
-## Design Notes
-
-* **Square encoding** — `sq = rank × 9 + file`; file 0 = USI file 9 (left), file 8 = USI file 1 (right); rank 0 = rank 'a' (top).
-* **Piece encoding** — `Piece = (color << 4) | piece_type`; BLACK = 0, WHITE = 1.
-* **Undo stack** — `StateInfo` (captured piece + previous Zobrist hash) is pushed on every `do_move` and popped on `undo_move`.
-* **Evaluation** — Bonanza 6.0 fv.bin 形式の3駒関係評価（KPP/KKP/KK/KP テーブル）。fv.bin が無い・不正な場合は駒割のみのフォールバック。
-* **Eval file auto-discovery** — 起動ディレクトリから `src/eval/fv.bin`、次に `eval/fv.bin` の順に探索。  
-  `setoption name EvalFile value <path>` または `SHOGIAI_EVAL_FILE` 環境変数で明示指定すると自動検出より優先。  
-  ファイルが無い・不正・非対応形式の場合は**安全に駒割のみフォールバック**へ自動切替します（探索は継続）。
-* **EvalFamily** — `EvalFamily::BONANZA_V6_FV`（fv.bin から読み込み）/ `MATERIAL_FALLBACK`（内蔵デフォルト）/ `NNUE_UNSUPPORTED`（NNUE ファイル検出、非対応）の 3 種類。NNUE ファイルを検出しても正常読み込みとして誤報告しません。
-* **Eval file format** — Bonanza 6.0 の生の fv.bin バイナリ（無改変）。期待サイズ・テーブル構成は上記「fv.bin のフォーマット」節を参照。
-* **License / source** — リポジトリ同梱コードは MIT。本物の fv.bin を利用する場合は、Bonanza のライセンス条件との整合性を確認してください。
-* **Search details** — 盤面 Zobrist hash を使う固定サイズの置換表、capture/promotion 中心の quiescence search、
-  hash move → captures/promotions → killer moves → history heuristic の順序付けを使います。
-* **Pruning** — 以前の「静的評価だけで `±INF` を返す」しきい値枝刈りは廃止し、
-  葉では quiescence search で戦術的な取り返しや成りを確認します。
-* **Alpha-beta score clamping** — 各ノードは着手側視点（negamax の「max side」）で評価するため、
-  評価値が -1000 以下になった場合は必ず -1000 として return します（mate スコアは対象外）。
-  親ノードは子の戻り値を符号反転して使う（`-search(...)`）ため、この下限クランプは
-  相手側（min side）から見た +1000 の上限クランプとしても自動的に成立します。
-
----
+* [Bonanza (Wikipedia)](https://ja.wikipedia.org/wiki/Bonanza) / [ianfab/bonanza](https://github.com/ianfab/bonanza)
+* [HiraokaTakuya/apery](https://github.com/HiraokaTakuya/apery)
+* [yaneurao/YaneuraOu](https://github.com/yaneurao/YaneuraOu)
 
 ## License
 
-MIT
+MIT（本物の `fv.bin` を組み合わせる場合は Bonanza のライセンス条件に従ってください）

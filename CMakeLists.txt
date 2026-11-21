@@ -2,10 +2,14 @@ cmake_minimum_required(VERSION 3.14)
 project(ShogiEngine CXX)
 find_package(Threads REQUIRED)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (default Release for engine speed)" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Warnings
+# Warnings & optimization defaults
 if(MSVC)
     add_compile_options(/W3)
 else()
@@ -20,10 +24,6 @@ add_library(shogi_core STATIC
     src/search.cpp
 )
 target_include_directories(shogi_core PUBLIC src)
-# Bake the repository's absolute source directory into eval.cpp so fv.bin
-# auto-discovery has a cwd-independent, always-correct candidate path
-# (src/eval/fv.bin), regardless of where the built binary is launched
-# from. See src/eval.cpp's build_discovery_candidates().
 target_compile_definitions(shogi_core PRIVATE SHOGIAI_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # ---- USI engine executable ----
@@ -39,7 +39,4 @@ enable_testing()
 add_test(NAME shogi_tests COMMAND shogi_tests)
 
 # ---- Copy eval parameter files to build directory ----
-# This makes eval/fv.bin available relative to the build directory,
-# which matches the auto-discovery path "eval/fv.bin".
-# Re-run cmake to pick up changes to src/eval/ files.
 file(COPY ${CMAKE_SOURCE_DIR}/src/eval DESTINATION ${CMAKE_BINARY_DIR})
