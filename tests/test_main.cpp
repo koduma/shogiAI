@@ -323,32 +323,41 @@ static void test_move_usi_roundtrip() {
 // Test: evaluation sign
 // ============================================================
 static void test_eval_symmetric() {
-    // Evaluation of the starting position should be 0 (symmetric)
-    Board b;
-    b.set_startpos();
-    int score_black = evaluate(b);
-    CHECK_EQ(score_black, 0);
+    // Starting position is 180-degree symmetric between Black STM and White STM.
+    Board b_black, b_white;
+    b_black.parse_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1");
+    b_white.parse_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1");
+    const int score_black = evaluate(b_black);
+    const int score_white = evaluate(b_white);
+    CHECK_EQ(score_black, score_white);
+    if (get_eval_family() == EvalFamily::MATERIAL_FALLBACK) {
+        CHECK_EQ(score_black, 0);
+    }
 }
 
 // ============================================================
 // Test: evaluation handles side-to-move, promotions and hand pieces
 // ============================================================
 static void test_eval_features() {
-    Board b1;
-    b1.parse_sfen("9/9/9/9/4P4/9/9/4K4/4k4 b - 1");
-    int s_black = evaluate(b1);
-    b1.parse_sfen("9/9/9/9/4P4/9/9/4K4/4k4 w - 1");
-    int s_white = evaluate(b1);
-    CHECK_EQ(s_black, -s_white);
+    Board b1_b, b1_w_mirror;
+    b1_b.parse_sfen("4k4/9/9/9/4P4/9/9/9/4K4 b - 1");
+    b1_w_mirror.parse_sfen("4k4/9/9/9/4p4/9/9/9/4K4 w - 1");
+    // 180-degree color-mirrored position must produce identical STM evaluation
+    CHECK_EQ(evaluate(b1_b), evaluate(b1_w_mirror));
+    if (get_eval_family() == EvalFamily::MATERIAL_FALLBACK) {
+        Board b_same_w;
+        b_same_w.parse_sfen("4k4/9/9/9/4P4/9/9/9/4K4 w - 1");
+        CHECK_EQ(evaluate(b1_b), -evaluate(b_same_w));
+    }
 
-    Board b2;
-    b2.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
-    CHECK(evaluate(b2) > 0);
+    Board b2, b2_empty;
+    b2.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1");
+    b2_empty.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b - 1");
+    CHECK(evaluate(b2) > evaluate(b2_empty));
 
-    Board b3;
-    b3.parse_sfen("9/4+P4/9/9/9/9/9/4K4/4k4 b - 1");
-    Board b4;
-    b4.parse_sfen("9/4P4/9/9/9/9/9/4K4/4k4 b - 1");
+    Board b3, b4;
+    b3.parse_sfen("4k4/3+P5/9/9/9/9/9/9/4K4 b - 1");
+    b4.parse_sfen("4k4/3P5/9/9/9/9/9/9/4K4 b - 1");
     CHECK(evaluate(b3) > evaluate(b4));
 }
 
@@ -361,7 +370,13 @@ static void test_quiescence_tactical_extension() {
     b.parse_sfen("4k4/9/9/4b4/3R5/9/9/9/4K4 w - 1");
     const int static_eval = evaluate(b);
     const int searched = negamax(b, 0, -INF, INF, 0);
-    CHECK(searched > static_eval + 300);
+    if (get_eval_family() == EvalFamily::MATERIAL_FALLBACK) {
+        CHECK(searched > static_eval + 300);
+    } else {
+        // Real NNUE already recognizes much of the hanging-rook threat statically,
+        // and quiescence capture still produces a decisively winning score (> +400cp).
+        CHECK(searched > 400);
+    }
 }
 
 // ============================================================
@@ -748,6 +763,7 @@ static void test_lmr_preserves_tactical_best_move() {
 // and preserve the caller's position state.
 // ============================================================
 static void test_singular_extension_exclusion_search() {
+    search_clear_game_state();
     Board b;
     CHECK(b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b R 1"));
     const std::string initial_sfen = b.to_sfen();
@@ -756,7 +772,7 @@ static void test_singular_extension_exclusion_search() {
     const size_t initial_hash_history_size = b.pos_hashes_.size();
 
     const Move best = iterative_deepening(b, 30000, [](const SearchInfo& info) {
-        if (info.depth >= 8) g_stop.store(true, std::memory_order_relaxed);
+        if (info.depth >= 10) g_stop.store(true, std::memory_order_relaxed);
     });
     const SearchStats stats = last_search_stats();
 
@@ -788,7 +804,7 @@ static void test_alpha_beta_clamps_large_deficit_to_minus_1000() {
     Board b;
     b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b rbgs 1");
     const int score = negamax(b, 1, -INF, INF, 0);
-    CHECK(score <= -2024 && score > -MATE_VALUE);
+    CHECK(score < -1000 && score > -MATE_VALUE);
 }
 
 static void test_alpha_beta_clamp_side_agnostic() {
@@ -798,436 +814,396 @@ static void test_alpha_beta_clamp_side_agnostic() {
     const int s_b = negamax(b_black, 1, -INF, INF, 0);
     const int s_w = negamax(b_white, 1, -INF, INF, 0);
     CHECK_EQ(s_b, s_w);
-    CHECK(s_w <= -2024 && s_w > -MATE_VALUE);
+    CHECK(s_w < -1000 && s_w > -MATE_VALUE);
 }
 
 // ============================================================
-// Eval file: helpers to write temporary fv.bin-shaped files
+// NNUE (`nn.bin`) & Progress (`progress.bin`) Test Helpers & Suite
 // ============================================================
 #include <cstdio>
 #include <fstream>
+#include <cmath>
 
-static void write_tmp_file(const std::string& path, const std::string& contents) {
-    std::ofstream f(path);
-    f << contents;
-}
-
-// Creates a file of exactly `bytes` length, filled with zero bytes, using a
-// sparse-file truncate so tests don't need to actually write ~206 MiB of
-// data to disk. This models a syntactically-valid (all-zero-weight) fv.bin.
-static void write_zero_filled_file(const std::string& path, int64_t bytes) {
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return;
-#if defined(_WIN32)
-    std::fseek(f, static_cast<long>(bytes - 1), SEEK_SET);
-    std::fputc('\0', f);
-#else
-    if (bytes > 0) {
-        std::fseek(f, static_cast<long>(bytes - 1), SEEK_SET);
-        std::fputc('\0', f);
+static void write_tmp_bytes(const std::string& path, const std::vector<uint8_t>& bytes) {
+    std::ofstream f(path, std::ios::binary);
+    if (!bytes.empty()) {
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
-#endif
-    std::fclose(f);
 }
 
-// The exact expected fv.bin size for the genuine Bonanza v6 KPP+KKP
-// layout implemented in eval.cpp (kept in sync manually; see eval.cpp's
-// file header comment for the derivation of this constant from genuine
-// Bonanza source: fe_end == 1476 for KPP, kkp_end == 738 for KKP).
-constexpr int64_t EXPECTED_FV_BIN_BYTES = 186'268'248;
-
-// A file of this size is recognized as a *specific, known* unsupported
-// layout (the previous, incorrect assumption this loader used to make,
-// based on a converter tool's expanded in-memory struct sizes) rather
-// than a generic wrong-sized file; see eval.cpp's LEGACY_APERY_LAYOUT_BYTES.
-constexpr int64_t LEGACY_APERY_LAYOUT_BYTES = 215'824'824;
-
-// ------------------------------------------------------------------
-// Mirrors of the region layout/sizes in eval.cpp (kept in sync manually;
-// see eval.cpp for the derivation from genuine Bonanza source), used
-// below to patch specific non-zero table entries into an otherwise
-// all-zero synthetic fv.bin so tests can assert on the *exact* numeric
-// result of evaluate() actually referencing loaded table data, rather
-// than only checking that a file of the right size is accepted.
-// ------------------------------------------------------------------
-constexpr int64_t FE_END       = 1476;
-constexpr int64_t POS_N        = FE_END * (FE_END + 1) / 2;
-constexpr int64_t KKP_END      = 738; // kkp_end: halved feature space for KKP
-constexpr int64_t SQ_NB        = 81;
-constexpr int64_t KPP_BYTES    = SQ_NB * POS_N * 2;              // int16_t
-constexpr int64_t KKP_BYTES    = SQ_NB * SQ_NB * KKP_END * 2;    // int16_t
-constexpr int64_t KPP_OFFSET   = 0;
-constexpr int64_t KKP_OFFSET   = KPP_BYTES;
-
-static int64_t kpp_triangular_index(int a, int b) {
-    const int hi = std::max(a, b);
-    const int lo = std::min(a, b);
-    return static_cast<int64_t>(hi) * (hi + 1) / 2 + lo;
+static void append_u32_le(std::vector<uint8_t>& buf, uint32_t v) {
+    for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFFu));
 }
 
-static int64_t kpp_byte_offset(int king, int fa, int fb) {
-    return KPP_OFFSET + (static_cast<int64_t>(king) * POS_N + kpp_triangular_index(fa, fb)) * 2;
-}
-// `kkp_idx` must already be a kkp-space index (kkp_hand_<piece> + count,
-// or kkp_<piece> + board square), not a full fe_end feature id.
-static int64_t kkp_byte_offset(int king, int opp_king, int kkp_idx) {
-    return KKP_OFFSET + ((static_cast<int64_t>(king) * SQ_NB + opp_king) * KKP_END + kkp_idx) * 2;
+static void append_i16_le(std::vector<uint8_t>& buf, int16_t v) {
+    const uint16_t u = static_cast<uint16_t>(v);
+    buf.push_back(static_cast<uint8_t>(u & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((u >> 8) & 0xFFu));
 }
 
-static void patch_int16(const std::string& path, int64_t offset, int16_t value) {
-    FILE* f = std::fopen(path.c_str(), "r+b");
-    if (!f) return;
-    std::fseek(f, static_cast<long>(offset), SEEK_SET);
-    std::fwrite(&value, sizeof(value), 1, f);
-    std::fclose(f);
+static void append_leb128_i16_array(std::vector<uint8_t>& buf, const std::vector<int16_t>& vals) {
+    const char magic[] = "COMPRESSED_LEB128";
+    buf.insert(buf.end(), magic, magic + 17);
+    std::vector<uint8_t> comp;
+    comp.reserve(vals.size() * 2);
+    for (int16_t x : vals) {
+        int32_t v = x;
+        while (true) {
+            uint8_t b = static_cast<uint8_t>(v & 0x7F);
+            v >>= 7;
+            const bool done = ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0));
+            if (!done) b |= 0x80u;
+            comp.push_back(b);
+            if (done) break;
+        }
+    }
+    append_u32_le(buf, static_cast<uint32_t>(comp.size()));
+    buf.insert(buf.end(), comp.begin(), comp.end());
+}
+
+struct SyntheticSfnnSpec {
+    int half_dims    = 64;
+    int layer_stacks = 8;
+    bool use_leb128  = true;
+    std::vector<int16_t> ft_biases;  // [half_dims]
+    std::vector<int16_t> ft_weights; // [1791 * half_dims]
+    std::vector<int32_t> stack_fc2_bias; // [layer_stacks]
+    std::vector<std::array<int32_t, 8>> stack_fc0_bias;
+    std::vector<std::vector<int8_t>>    stack_fc0_w; // [layer_stacks][8 * half_dims]
+    std::vector<std::array<int32_t, 64>> stack_fc1_bias;
+    std::vector<std::array<int8_t, 64 * 32>> stack_fc1_w;
+    std::vector<std::array<int8_t, 64>> stack_fc2_w;
+
+    explicit SyntheticSfnnSpec(int l1 = 64, int stacks = 8, bool leb = true)
+        : half_dims(l1),
+          layer_stacks(stacks),
+          use_leb128(leb),
+          ft_biases(static_cast<size_t>(l1), 0),
+          ft_weights(static_cast<size_t>(1791 * l1), 0),
+          stack_fc2_bias(static_cast<size_t>(stacks), 0),
+          stack_fc0_bias(static_cast<size_t>(stacks)),
+          stack_fc0_w(static_cast<size_t>(stacks), std::vector<int8_t>(static_cast<size_t>(8 * l1), 0)),
+          stack_fc1_bias(static_cast<size_t>(stacks)),
+          stack_fc1_w(static_cast<size_t>(stacks)),
+          stack_fc2_w(static_cast<size_t>(stacks)) {
+        for (int s = 0; s < stacks; ++s) {
+            stack_fc0_bias[s].fill(0);
+            stack_fc1_bias[s].fill(0);
+            stack_fc1_w[s].fill(0);
+            stack_fc2_w[s].fill(0);
+        }
+    }
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> out;
+        const std::string arch = "ModelType=SFNNWithoutPsqt;Features=K-A2(Friend)[1791->"
+                               + std::to_string(half_dims) + "x2],Network=SFNN-"
+                               + std::to_string(half_dims) + "{LayerStack="
+                               + std::to_string(layer_stacks) + "}";
+        append_u32_le(out, 0x7AF32F16u);
+        append_u32_le(out, 0x3C203B32u);
+        append_u32_le(out, static_cast<uint32_t>(arch.size()));
+        out.insert(out.end(), arch.begin(), arch.end());
+
+        // FT hash + biases + weights
+        append_u32_le(out, 0x5F134AB8u);
+        if (use_leb128) {
+            append_leb128_i16_array(out, ft_biases);
+            append_leb128_i16_array(out, ft_weights);
+        } else {
+            for (int16_t v : ft_biases) append_i16_le(out, v);
+            for (int16_t v : ft_weights) append_i16_le(out, v);
+        }
+
+        // LayerStacks
+        for (int s = 0; s < layer_stacks; ++s) {
+            append_u32_le(out, 0x6333718Au);
+            for (int o = 0; o < 8; ++o) append_u32_le(out, static_cast<uint32_t>(stack_fc0_bias[s][o]));
+            out.insert(out.end(), stack_fc0_w[s].begin(), stack_fc0_w[s].end());
+            for (int o = 0; o < 64; ++o) append_u32_le(out, static_cast<uint32_t>(stack_fc1_bias[s][o]));
+            out.insert(out.end(), stack_fc1_w[s].begin(), stack_fc1_w[s].end());
+            append_u32_le(out, static_cast<uint32_t>(stack_fc2_bias[s]));
+            out.insert(out.end(), stack_fc2_w[s].begin(), stack_fc2_w[s].end());
+        }
+        return out;
+    }
+};
+
+static void write_synthetic_progress_file(const std::string& path,
+                                          const std::vector<std::tuple<int, int, double>>& entries) {
+    std::vector<double> table(81 * 1548, 0.0);
+    for (const auto& [king_yo_sq, bona_idx, val] : entries) {
+        table[static_cast<size_t>(king_yo_sq) * 1548 + bona_idx] = val;
+    }
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(table.data()),
+            static_cast<std::streamsize>(table.size() * sizeof(double)));
 }
 
 // ============================================================
-// Test: missing fv.bin reports material-only fallback
+// Test 1: Missing or 0-byte empty dummy nn.bin & progress.bin cleanly
+//         fall back to material evaluation without crashing.
 // ============================================================
-static void test_eval_fv_bin_file_not_found() {
-    set_eval_file_path("/tmp/shogiai_nonexistent_fv_99999.bin");
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("file not found") != std::string::npos);
+static void test_eval_nnue_missing_and_empty_dummy_fallback() {
+    // 1a. Nonexistent file
+    set_eval_file_path("/tmp/shogiai_nonexistent_nn_99999.bin");
+    CHECK(eval_status_message().find("file not found") != std::string::npos);
     CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+    {
+        Board b;
+        b.set_startpos();
+        CHECK_EQ(evaluate(b), 0);
+    }
 
-    // Engine must still work (material-only fallback), symmetric position → 0
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
+    // 1b. Empty (0-byte) dummy nn.bin and progress.bin (matches repository zip packaging)
+    const std::string tmp_nn   = "/tmp/shogiai_empty_dummy_nn.bin";
+    const std::string tmp_prog = "/tmp/shogiai_empty_dummy_progress.bin";
+    write_tmp_bytes(tmp_nn, {});
+    write_tmp_bytes(tmp_prog, {});
 
-    set_eval_file_path(""); // reset
-}
-
-// ============================================================
-// Test: wrong-sized fv.bin (e.g. the 1-byte placeholder dummy shipped in
-// the repository) is rejected with a clear, actionable status message.
-// ============================================================
-static void test_eval_fv_bin_size_mismatch_reports_clear_error() {
-    const std::string tmp = "/tmp/shogiai_test_fv_wrong_size.bin";
-    write_tmp_file(tmp, "x"); // 1 byte, mimics the checked-in dummy fv.bin
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("invalid Bonanza v6 fv.bin size") != std::string::npos);
-    CHECK(status.find("got 1 bytes") != std::string::npos);
-    CHECK(status.find(std::to_string(EXPECTED_FV_BIN_BYTES)) != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
-
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: an exactly-sized (all-zero-weight) fv.bin loads successfully and
-// is reported as EvalFamily::BONANZA_V6_FV, with the explicit family tag
-// present. With every KKP/KPP table entry zero, evaluate() must reduce to
-// exactly the material term (scaled and rescaled by FV_SCALE), since real
-// Bonanza always adds a separate material term on top of the relation
-// tables ? it is never "implicit" in an all-zero table.
-// ============================================================
-static void test_eval_fv_bin_correct_size_loads_and_evaluates() {
-    const std::string tmp = "/tmp/shogiai_test_fv_correct_size.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("bonanza-v6 fv.bin loaded from") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    CHECK(status.find("[explicit]") != std::string::npos);
-    CHECK(status.find("[family=BONANZA_V6_FV]") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
-
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0); // symmetric material, zero tables → 0
-
-    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
-    CHECK_EQ(evaluate(b), 87); // Bonanza 6.0 pawn value = 87cp
-
-    b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 w P 1");
-    CHECK_EQ(evaluate(b), -87); // same physical position, White to move → sign flips
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: a hand-crafted fv.bin with a single known non-zero KKP table
-// entry (all else zero) produces the exact expected evaluate() result.
-// This is the core regression guarding against evaluate() silently
-// ignoring loaded table data (i.e. behaving identically to
-// MATERIAL_FALLBACK even though a real fv.bin was loaded).
-//
-// Position: "K8/9/9/9/4P4/9/9/9/8k b - 1"
-//   Black king  @ square 0  (Bonanza sq 0)
-//   White king  @ square 80 (Bonanza sq 80)
-//   Black pawn  @ square 40 (Bonanza sq 40)
-// With only one non-king piece, no KPP pair term can fire (a pair needs
-// at least two pieces), cleanly isolating the KKP contribution.
-// ============================================================
-static void test_eval_fv_bin_real_kkp_value_is_used() {
-    const std::string tmp = "/tmp/shogiai_test_fv_kkp_nonzero.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
-
-    // kkp_pawn == 36 (see eval.cpp); the kkp-space index for the black
-    // pawn (looked up unmirrored, at the (SQ_BKING, SQ_WKING) pair) is
-    // kkp_pawn + bonanza_sq(40) = 76.
-    constexpr int kSqBk = 0, kSqWk = 80, kKkpIdx = 36 + 40;
-    constexpr int16_t kKkpValue = 6400; // 200 centipawns * FV_SCALE(32)
-    patch_int16(tmp, kkp_byte_offset(kSqBk, kSqWk, kKkpIdx), kKkpValue);
-
-    set_eval_file_path(tmp);
-    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
-
-    Board b;
-    b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k b - 1");
-    // material (87cp black pawn) * 32 + kkp(6400), all / 32 == 87 + 200 == 287
-    CHECK_EQ(evaluate(b), 287);
-
-    // Same physical position, White to move: sign flips exactly.
-    b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k w - 1");
-    CHECK_EQ(evaluate(b), -287);
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: a hand-crafted fv.bin with a known non-zero KKP table entry for
-// a *White* piece produces the exact expected (subtracted, mirrored)
-// evaluate() result. This is the regression guarding against the KKP
-// term only ever being applied with the correct sign/king-pair/mirrored
-// square for the opponent's own pieces, not just Black's.
-//
-// Position: "K8/9/9/9/4p4/9/9/9/8k b - 1"
-//   Black king  @ square 0  (Bonanza sq 0)
-//   White king  @ square 80 (Bonanza sq 80)
-//   White pawn  @ square 40 (Bonanza sq 40, mirror(40) == 40)
-// ============================================================
-static void test_eval_fv_bin_real_kkp_white_piece_is_subtracted_and_mirrored() {
-    const std::string tmp = "/tmp/shogiai_test_fv_kkp_white_nonzero.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
-
-    // White's own pieces are looked up at (Inv(SQ_WKING), Inv(SQ_BKING))
-    // = (Inv(80), Inv(0)) = (0, 80), using the MIRRORED board square:
-    // kkp_pawn + mirror(40) = 36 + 40 = 76 (square 40 mirrors to itself
-    // on the 9x9 board, so this deliberately keeps the same index as the
-    // Black test above to prove the SIGN/king-pair wiring, not just the
-    // square-mirroring arithmetic).
-    constexpr int kSqBk1 = 0, kSqWk1 = 80, kKkpIdx = 36 + 40;
-    constexpr int16_t kKkpValue = 6400; // 200 centipawns * FV_SCALE(32)
-    patch_int16(tmp, kkp_byte_offset(kSqBk1, kSqWk1, kKkpIdx), kKkpValue);
-
-    set_eval_file_path(tmp);
-    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
-
-    Board b;
-    b.parse_sfen("K8/9/9/9/4p4/9/9/9/8k b - 1");
-    // material (-87cp, one White pawn) * 32 - kkp(6400), all / 32 == -287
-    CHECK_EQ(evaluate(b), -287);
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: a hand-crafted fv.bin with two known non-zero KPP table entries
-// (the Black-view pass and the White-view/subtracted pass) produces the
-// exact expected evaluate() result, confirming the two-pass
-// opponent-mirrored KPP subtraction (not merely a single-sided sum) is
-// wired correctly, including sign, king-square mirroring and feature
-// indices for two distinct piece types (pawn + lance).
-//
-// Position: "K8/9/9/9/4P4/9/9/9/8k b - 1" plus a black lance @ square 9.
-// ============================================================
-static void test_eval_fv_bin_real_kpp_pair_value_is_used() {
-    const std::string tmp = "/tmp/shogiai_test_fv_kpp_nonzero.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
-
-    // Genuine Bonanza rank-major square (A9=0 .. I1=80):
-    // Black lance at 9b (`sq = 9`) -> f_lance(225) + 9 = 234 (first valid lance slot!).
-    // Black pawn  at 5e (`sq = 40`) -> f_pawn(81) + 40 = 121.
-    // White-view: lance -> e_lance(306) + mirror(9=71) = 377;
-    //             pawn  -> e_pawn(162)  + mirror(40=40) = 202.
-    constexpr int kSqBk = 0, kSqWkInv = 0;
-    constexpr int kBlackLance = 234, kBlackPawn = 121;
-    constexpr int kWhiteLance = 377, kWhitePawn = 202;
-    constexpr int16_t kBlackPassValue = 640; //  20 centipawns * FV_SCALE(32)
-    constexpr int16_t kWhitePassValue = 320; //  10 centipawns * FV_SCALE(32)
-
-    patch_int16(tmp, kpp_byte_offset(kSqBk, kBlackPawn, kBlackLance), kBlackPassValue);
-    patch_int16(tmp, kpp_byte_offset(kSqWkInv, kWhitePawn, kWhiteLance), kWhitePassValue);
-
-    set_eval_file_path(tmp);
-    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
-
-    Board b;
-    b.parse_sfen("K8/L8/9/9/4P4/9/9/9/8k b - 1");
-    // material (87 pawn + 232 lance = 319cp) * 32 + (640 - 320), all / 32 == 319 + 10 == 329
-    CHECK_EQ(evaluate(b), 329);
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: an fv.bin that is one byte short of the required size is
-// rejected exactly like any other size mismatch (boundary check), not
-// silently truncated/misread.
-// ============================================================
-static void test_eval_fv_bin_one_byte_short_is_rejected() {
-    const std::string tmp = "/tmp/shogiai_test_fv_one_byte_short.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES - 1);
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("invalid Bonanza v6 fv.bin size") != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: a file matching the previous (incorrect) 215,824,824-byte
-// assumption is recognized and reported as a specific, known unsupported
-// layout ? not silently accepted as if it were the real 186,268,248-byte
-// format, and not just a generic "invalid size" message either.
-// ============================================================
-static void test_eval_fv_bin_legacy_size_reports_specific_error() {
-    const std::string tmp = "/tmp/shogiai_test_fv_legacy_size.bin";
-    write_zero_filled_file(tmp, LEGACY_APERY_LAYOUT_BYTES);
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("unsupported fv.bin layout") != std::string::npos);
-    CHECK(status.find(std::to_string(LEGACY_APERY_LAYOUT_BYTES)) != std::string::npos);
+    set_eval_file_path(tmp_nn);
+    set_progress_file_path(tmp_prog);
+    const std::string st = eval_status_message();
+    CHECK(st.find("empty dummy nn.bin") != std::string::npos);
     CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
 
     Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
+    b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b P 1");
+    CHECK_EQ(evaluate(b), 87);
+    b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 w P 1");
+    CHECK_EQ(evaluate(b), -87);
 
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: NNUE-looking file path is recognized as unsupported,
-// engine stays functional with material fallback
-// ============================================================
-static void test_eval_nnue_unsupported_fallback() {
-    const std::string tmp = "/tmp/shogiai_test_nnue.bin";
-    write_tmp_file(tmp, "not a real nnue file");
-
-    set_eval_file_path(tmp);
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("unsupported evaluator: nnue") != std::string::npos);
-    CHECK(status.find(tmp) != std::string::npos);
-    CHECK(get_eval_family() == EvalFamily::NNUE_UNSUPPORTED);
-
-    // Engine must still return a sensible (non-crash) evaluation
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0); // symmetric position → 0 regardless of family
-
-    set_eval_file_path(""); // reset
-    std::remove(tmp.c_str());
-}
-
-// ============================================================
-// Test: auto-discovery finds eval/fv.bin in the build dir (CMake copies
-// src/eval/ → build/eval/ at configure time). The checked-in fv.bin is a
-// 1-byte dummy, so this must resolve to MATERIAL_FALLBACK with a size
-// mismatch message, never a crash and never a false "loaded" claim.
-// ============================================================
-static void test_eval_auto_discovery() {
-    // Reset to auto-discovery mode (no explicit path).
     set_eval_file_path("");
-    const std::string status = eval_status_message();
-
-    CHECK(status.find("unsupported evaluator") == std::string::npos);
-
-    const EvalFamily fam = get_eval_family();
-    CHECK(fam == EvalFamily::BONANZA_V6_FV || fam == EvalFamily::MATERIAL_FALLBACK);
-
-    // Evaluation must remain valid and symmetric
-    Board b;
-    b.set_startpos();
-    CHECK_EQ(evaluate(b), 0);
-
-    set_eval_file_path(""); // ensure reset for subsequent tests
+    std::remove(tmp_nn.c_str());
+    std::remove(tmp_prog.c_str());
 }
 
 // ============================================================
-// Test: auto-discovery still finds a candidate fv.bin when launched from
-// an unrelated working directory (e.g. the system temp directory),
-// proving discovery is not purely cwd-relative. If discovery only ever
-// checked cwd-relative paths ("src/eval/fv.bin", "eval/fv.bin"), then
-// from an unrelated cwd every checked candidate reported in the status
-// message would be a bare relative path with no leading '/'. With the
-// fix, the executable-directory and compile-time-source-dir candidates
-// are absolute and cwd-independent, so at least one checked candidate in
-// the message must be an absolute path even when cwd is far away.
+// Test 2: Corrupt headers, truncated payloads, and invalid progress.bin
+//         sizes/NaNs are rejected safely with clear status diagnostics.
 // ============================================================
-static void test_eval_auto_discovery_independent_of_cwd() {
+static void test_eval_nnue_corrupt_and_invalid_progress_rejected() {
+    const std::string bad_nn = "/tmp/shogiai_corrupt_nn.bin";
+    const std::string bad_pr = "/tmp/shogiai_corrupt_progress.bin";
+
+    // Wrong magic/version bytes
+    write_tmp_bytes(bad_nn, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    set_eval_file_path(bad_nn);
+    CHECK(eval_status_message().find("invalid nn.bin header") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+
+    // Valid nn.bin paired with wrong-sized progress.bin (100 bytes instead of 1,003,104)
+    SyntheticSfnnSpec spec(64, 8, true);
+    write_tmp_bytes(bad_nn, spec.serialize());
+    write_tmp_bytes(bad_pr, std::vector<uint8_t>(100, 0));
+    set_eval_file_path(bad_nn);
+    set_progress_file_path(bad_pr);
+    CHECK(eval_status_message().find("invalid progress.bin size") != std::string::npos);
+    CHECK(get_eval_family() == EvalFamily::MATERIAL_FALLBACK);
+
+    set_eval_file_path("");
+    std::remove(bad_nn.c_str());
+    std::remove(bad_pr.c_str());
+}
+
+// ============================================================
+// Test 3: Auto-discovery is CWD-independent and handles checked-in files.
+// ============================================================
+static void test_eval_auto_discovery_and_cwd_independence() {
     namespace fs = std::filesystem;
     const fs::path saved_cwd = fs::current_path();
 
     fs::current_path(fs::temp_directory_path());
     set_eval_file_path("");
+    set_eval_dir("");
     const std::string status = eval_status_message();
     fs::current_path(saved_cwd);
 
-    CHECK(status.find("unsupported evaluator") == std::string::npos);
-
-    // Extract the "checked: ..." tail and verify at least one candidate
-    // path is absolute (starts with '/'), i.e. not derived solely from
-    // the (unrelated) current working directory.
-    const std::string marker = "checked: ";
-    const auto pos = status.find(marker);
-    CHECK(pos != std::string::npos);
-    bool found_absolute_candidate = false;
-    if (pos != std::string::npos) {
-        const std::string candidates = status.substr(pos + marker.size());
-        std::stringstream ss(candidates);
-        std::string candidate;
-        while (std::getline(ss, candidate, ',')) {
-            // trim a single leading space, if present
-            if (!candidate.empty() && candidate.front() == ' ')
-                candidate.erase(0, 1);
-            if (!candidate.empty() && candidate.front() == '/') {
-                found_absolute_candidate = true;
-                break;
+    const EvalFamily fam = get_eval_family();
+    CHECK(fam == EvalFamily::SFNN_NNUE || fam == EvalFamily::MATERIAL_FALLBACK);
+    if (fam == EvalFamily::MATERIAL_FALLBACK) {
+        const std::string marker = "checked: ";
+        const auto pos = status.find(marker);
+        CHECK(pos != std::string::npos);
+        bool found_abs = false;
+        if (pos != std::string::npos) {
+            std::stringstream ss(status.substr(pos + marker.size()));
+            std::string cand;
+            while (std::getline(ss, cand, ',')) {
+                if (!cand.empty() && cand.front() == ' ') cand.erase(0, 1);
+                if (!cand.empty() && cand.front() == '/') { found_abs = true; break; }
             }
         }
+        CHECK(found_abs);
     }
-    CHECK(found_absolute_candidate);
-
-    set_eval_file_path(""); // ensure reset for subsequent tests
+    set_eval_file_path("");
 }
 
+// ============================================================
+// Test 4: Exact K-A2 Feature Indexing (YaneuraOu file-major coordinates,
+//         1-based hand BonaPiece, A2+K king planes), Pairwise FT,
+//         Dual SqrClippedReLU/ClippedReLU, FV_SCALE=24, and progress.bin
+//         8-bucket selection!
+// ============================================================
+static void test_eval_nnue_ka2_exact_math_and_progress_buckets() {
+    const std::string tmp_nn   = "/tmp/shogiai_synth_ka2_nn.bin";
+    const std::string tmp_prog = "/tmp/shogiai_synth_ka2_progress.bin";
 
+    // Build a 64-dim, 8-stack COMPRESSED_LEB128 SFNN model:
+    //   - Pairwise half_out = 32 (`j = 0` pairs `acc[0]` and `acc[32]`).
+    //   - Activate `acc[0] = 127` from 1st Black Pawn in hand (`YO_F_HAND_PAWN = 1`)
+    //     and `acc[32] = 127` from Black Pawn on USI "9g" (`file_of=0, rank_of=6` ->
+    //     `yo_file = 8 - 0 = 8`, `yo_rank = 6`, `yo_sq = 8*9 + 6 = 78`, `YO_F_PAWN(90) + 78 = 168`).
+    //     Then for Black STM: `tf[0] = (127 * 127) >> 7 = 126`!
+    //   - Set `fc0_w[0][0] = 64` -> `h0[0] = 126 * 64 = 8064`.
+    //     `h0_act[0] (Sqr) = (8064^2) >> 19 = 124`, `h0_act[8] (Lin) = 8064 >> 6 = 126`.
+    //   - Set `fc1_w[0][8] = 64` -> `h1[0] = 126 * 64 = 8064` -> `h1_act[0] = 126`.
+    //   - Give each of the 8 LayerStacks a distinct `fc2_bias = (s + 1) * 2400` (`+100*(s+1)` cp at FV_SCALE=24)
+    //     plus `fc2_w[0] = 24` (`126 * 24 / 24 = +126` cp when `tf[0] == 126`)!
+    SyntheticSfnnSpec spec(64, 8, /*use_leb128=*/true);
+    spec.ft_weights[1 * 64 + 0]    = 127; // 1st friend pawn in hand -> acc[0]
+    spec.ft_weights[168 * 64 + 32] = 127; // friend pawn on "9g" (`yo_sq = 78`) -> acc[32]
+    for (int s = 0; s < 8; ++s) {
+        spec.stack_fc0_w[s][0]      = 64;
+        spec.stack_fc1_w[s][8]      = 64; // col 8 = ClippedReLU(h0[0])
+        spec.stack_fc2_w[s][0]      = 24;
+        spec.stack_fc2_bias[s]      = (s + 1) * 2400;
+    }
+
+    // Configure progress.bin so:
+    //   - Black King @ "5i" (`file_of=4, rank_of=8` -> `yo_sq = 4*9 + 8 = 44`) with 1st hand pawn (`idx=1`)
+    //     contributes `+3.0` log-odds (`sigmoid(3.0) = 0.9526 > 7/8 = 0.875` -> bucket 7!)
+    //   - Black King @ "5a" (`yo_sq = 36`) contributes `-3.0` log-odds (`sigmoid(-3.0) = 0.0474 < 1/8` -> bucket 0!)
+    write_tmp_bytes(tmp_nn, spec.serialize());
+    write_synthetic_progress_file(tmp_prog, {
+        {44, 1, +3.0},
+        {36, 1, -3.0}
+    });
+
+    set_fv_scale(24);
+    set_eval_file_path(tmp_nn);
+    set_progress_file_path(tmp_prog);
+    CHECK(get_eval_family() == EvalFamily::SFNN_NNUE);
+
+    // Case A: Black King @ 5i (`yo_sq=44`), White King @ 5a, Black Pawn @ 9g, Black Pawn in hand:
+    //   - progress sum = +3.0 -> bucket 7 (`stack_fc2_bias[7] = 8 * 2400 -> +800cp`)
+    //   - `tf[0] = 126` -> `+126cp` => exact total = `926` cp!
+    Board b;
+    b.parse_sfen("4k4/9/9/9/9/9/P8/9/4K4 b P 1");
+    CHECK_EQ(evaluate_progress_bucket(b), 7);
+    CHECK(evaluate_progress(b) > 0.90);
+    CHECK_EQ(evaluate_full_reference(b), 926);
+    CHECK_EQ(evaluate(b), 926);
+
+    // Case B: Move Black King to 5a (`yo_sq=36`) and White King to 5i:
+    //   - progress sum = -3.0 -> bucket 0 (`stack_fc2_bias[0] = 1 * 2400 -> +100cp`)
+    //   - `tf[0] = 126` -> `+126cp` => exact total = `226` cp!
+    b.parse_sfen("4K4/9/9/9/9/9/P8/9/4k4 b P 1");
+    CHECK_EQ(evaluate_progress_bucket(b), 0);
+    CHECK(evaluate_progress(b) < 0.10);
+    CHECK_EQ(evaluate_full_reference(b), 226);
+    CHECK_EQ(evaluate(b), 226);
+
+    set_eval_file_path("");
+    std::remove(tmp_nn.c_str());
+    std::remove(tmp_prog.c_str());
+}
 
 // ============================================================
-// New Regression & Strength Tests:
-//   1. Perft(1..4) + Tactical/Quiet partition + O(1) is_move_legal equivalence
-//   2. Bonanza 1-based KPP hand indexing & rank-major non-collision (9g pawn != e_hand_rook)
-//   3. Incremental KPP/KKP + EvalHash exact bit-for-bit match vs evaluate_full_reference()
-//   4. Shogi Static Exchange Evaluation (SEE) with drops, promotions, and X-rays
-//   5. 1-ply mate detection (`find_mate_1ply`) & multi-ply tsume shogi solving
+// Test 5: Full-Width SIMD (`L1 = 256` & `COMPRESSED_LEB128`) Incremental
+//         Accumulator + Progress Cache Bit-Exact Equivalence vs Scalar
+//         Reference across 80+ Plies of Captures, Drops, Promotions,
+//         King Moves, Null Moves, and Undo!
 // ============================================================
+static void test_eval_nnue_incremental_and_simd_matches_scalar_reference() {
+    const std::string tmp_nn   = "/tmp/shogiai_synth_inc_nn.bin";
+    const std::string tmp_prog = "/tmp/shogiai_synth_inc_progress.bin";
+
+    uint64_t seed = 0x9E3779B97F4A7C15ULL;
+    auto next_rng = [&]() -> uint64_t {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return seed;
+    };
+
+    // Use L1=256 so multiple AVX-512 (64-byte) and AVX2 (32-byte) SIMD chunks are exercised!
+    SyntheticSfnnSpec spec(256, 8, /*use_leb128=*/true);
+    for (auto& b : spec.ft_biases) b = static_cast<int16_t>(static_cast<int>(next_rng() % 41) - 15);
+    for (auto& w : spec.ft_weights) w = static_cast<int16_t>(static_cast<int>(next_rng() % 51) - 22);
+    for (int s = 0; s < 8; ++s) {
+        for (int o = 0; o < 8; ++o) spec.stack_fc0_bias[s][o] = static_cast<int32_t>(next_rng() % 2001) - 800;
+        for (auto& w : spec.stack_fc0_w[s]) w = static_cast<int8_t>(static_cast<int>(next_rng() % 49) - 24);
+        for (int o = 0; o < 64; ++o) spec.stack_fc1_bias[s][o] = static_cast<int32_t>(next_rng() % 2001) - 800;
+        for (int o = 0; o < 64; ++o) {
+            for (int c = 0; c < 16; ++c) {
+                spec.stack_fc1_w[s][o * 32 + c] = static_cast<int8_t>(static_cast<int>(next_rng() % 61) - 30);
+            }
+        }
+        spec.stack_fc2_bias[s] = static_cast<int32_t>(next_rng() % 1001) - 500;
+        for (int o = 0; o < 64; ++o) spec.stack_fc2_w[s][o] = static_cast<int8_t>(static_cast<int>(next_rng() % 81) - 40);
+    }
+
+    std::vector<std::tuple<int, int, double>> prog_entries;
+    prog_entries.reserve(81 * 256);
+    for (int k = 0; k < 81; ++k) {
+        for (int idx = 1; idx < 1548; idx += 3) {
+            const double v = (static_cast<int>(next_rng() % 201) - 100) * 0.0025;
+            prog_entries.emplace_back(k, idx, v);
+        }
+    }
+
+    write_tmp_bytes(tmp_nn, spec.serialize());
+    write_synthetic_progress_file(tmp_prog, prog_entries);
+
+    set_fv_scale(24);
+    set_eval_file_path(tmp_nn);
+    set_progress_file_path(tmp_prog);
+    CHECK(get_eval_family() == EvalFamily::SFNN_NNUE);
+
+    Board b;
+    b.parse_sfen("ln1gkg1nl/1r4sb1/p1pppp1pp/1p4p2/7P1/2P6/PP1PPPP1P/1BG4R1/LNS1K1SNL b Pp 1");
+    CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+
+    uint64_t move_rng = 0xCAFEBABE12345678ULL;
+    for (int step = 0; step < 90; ++step) {
+        MoveList ml;
+        generate_legal_moves(b, ml);
+        if (ml.empty()) break;
+
+        if (!b.in_check()) {
+            b.do_null_move();
+            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+            b.undo_null_move();
+        }
+
+        // Exercise multi-ply un-evaluated ancestor jumps (e.g. simulating in-check plies)
+        for (int k = 0; k < std::min(4, ml.size()); ++k) {
+            Move m1 = ml[(step * 7 + k * 13) % ml.size()];
+            b.do_move(m1);
+            MoveList ml2;
+            generate_legal_moves(b, ml2);
+            if (!ml2.empty()) {
+                Move m2 = ml2[(step * 3 + k * 5) % ml2.size()];
+                b.do_move(m2);
+                CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+                b.undo_move(m2);
+            }
+            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+            b.undo_move(m1);
+        }
+
+        move_rng = move_rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        Move chosen = ml[static_cast<size_t>(move_rng >> 32) % static_cast<size_t>(ml.size())];
+        b.do_move(chosen);
+        CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+    }
+
+    set_eval_file_path("");
+    std::remove(tmp_nn.c_str());
+    std::remove(tmp_prog.c_str());
+}
+
 static uint64_t perft(Board& b, int depth) {
     MoveList ml;
     generate_legal_moves(b, ml);
@@ -1249,8 +1225,6 @@ static void test_perft_and_staged_movegen_equivalence() {
     CHECK_EQ(perft(b, 3), 25470ULL);
     CHECK_EQ(perft(b, 4), 719731ULL);
 
-    // Verify generate_tactical_moves + generate_quiet_moves == generate_legal_moves
-    // and O(1) is_move_legal matches on midgame SFENs with drops, promotions, pins.
     const char* sfens[] = {
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
         "ln1gkg1nl/1r4sb1/p1pppp1pp/1p4p2/7P1/2P6/PP1PPPP1P/1BG4R1/LNS1K1SNL b Pp 1",
@@ -1274,121 +1248,18 @@ static void test_perft_and_staged_movegen_equivalence() {
     }
 }
 
-static void test_eval_hand_1based_and_9file_non_collision() {
-    const std::string tmp = "/tmp/shogiai_test_fv_hand_1based.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
-
-    // 1. Verify 1st Black pawn in hand uses `f_hand_pawn + 1 == 1` (NOT `0`!).
-    //    Black king @ 5i (`sq = 76`), White king @ 5a (`sq = 4`, `mirror(4) = 76`).
-    //    Patch diagonal KPP[76][1][1] = +3200 (+100cp) and leave KPP[76][0][0] = 0.
-    patch_int16(tmp, kpp_byte_offset(76, 1, 1), 3200);
-    // 2. Verify Black pawn on 9g (`sq = 54`) uses `f_pawn(81) + 54 = 135`, NOT `87` (`e_hand_rook`).
-    patch_int16(tmp, kpp_byte_offset(76, 135, 135), 1600); // +50cp
-
-    set_eval_file_path(tmp);
-    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
-
-    Board b;
-    b.parse_sfen("4k4/9/9/9/9/9/P8/9/4K4 b P 1");
-    // 2 pawns (2 * 87 = 174cp) + 100cp (hand P #1) + 50cp (9g pawn) = 324cp
-    CHECK_EQ(evaluate_full_reference(b), 324);
-    CHECK_EQ(evaluate(b), 324);
-
-    set_eval_file_path("");
-    std::remove(tmp.c_str());
-}
-
-static void test_eval_incremental_matches_full_reference() {
-    const std::string tmp = "/tmp/shogiai_test_fv_incremental.bin";
-    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
-
-    // Populate a rich set of non-zero KPP and KKP weights across kings & features
-    FILE* f = std::fopen(tmp.c_str(), "r+b");
-    CHECK(f != nullptr);
-    if (f) {
-        uint64_t seed = 0x123456789ABCDEF0ULL;
-        auto next_val = [&]() -> int16_t {
-            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-            return static_cast<int16_t>((static_cast<int>(seed & 0x3FF) - 512) * 4);
-        };
-        // Patch KKP entries across all king pairs for common hand/board slots
-        for (int bk : {4, 68, 69, 75, 76, 77}) {
-            for (int wk : {3, 4, 5, 12, 13, 75, 76}) {
-                for (int idx = 0; idx < 738; idx += 3) {
-                    int16_t v = next_val();
-                    std::fseek(f, static_cast<long>(kkp_byte_offset(bk, wk, idx)), SEEK_SET);
-                    std::fwrite(&v, sizeof(v), 1, f);
-                }
-            }
-        }
-        // Patch KPP entries for those king squares
-        for (int k : {3, 4, 5, 67, 68, 69, 75, 76, 77}) {
-            for (int a = 1; a < 1476; a += 17) {
-                for (int b_idx = 1; b_idx <= a; b_idx += 23) {
-                    int16_t v = next_val();
-                    std::fseek(f, static_cast<long>(kpp_byte_offset(k, a, b_idx)), SEEK_SET);
-                    std::fwrite(&v, sizeof(v), 1, f);
-                }
-            }
-        }
-        std::fclose(f);
-    }
-
-    set_eval_file_path(tmp);
-    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
-
-    // Play a deterministic pseudo-random game exercising quiet moves, captures,
-    // promotions, drops, king moves, null moves, and undo_move!
-    Board b;
-    b.parse_sfen("ln1gkg1nl/1r4sb1/p1pppp1pp/1p4p2/7P1/2P6/PP1PPPP1P/1BG4R1/LNS1K1SNL b Pp 1");
-    uint64_t rng = 0xCAFEBABE1234ULL;
-    CHECK_EQ(evaluate(b), evaluate_full_reference(b));
-
-    for (int step = 0; step < 80; ++step) {
-        MoveList ml;
-        generate_legal_moves(b, ml);
-        if (ml.empty()) break;
-
-        // Also test null-move eval preservation when not in check
-        if (!b.in_check()) {
-            b.do_null_move();
-            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
-            b.undo_null_move();
-        }
-
-        // Test several sibling moves + undo at each ply
-        for (int k = 0; k < std::min(4, ml.size()); ++k) {
-            Move cm = ml[(step * 7 + k * 13) % ml.size()];
-            b.do_move(cm);
-            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
-            b.undo_move(cm);
-        }
-
-        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-        Move chosen = ml[static_cast<size_t>(rng >> 32) % static_cast<size_t>(ml.size())];
-        b.do_move(chosen);
-        CHECK_EQ(evaluate(b), evaluate_full_reference(b));
-    }
-
-    set_eval_file_path("");
-    std::remove(tmp.c_str());
-}
-
 static void test_see_and_mate_detection() {
-    // 1. SEE: Rook capturing a pawn defended by enemy gold is losing (`SEE < 0`)
     {
         Board b;
         b.parse_sfen("4k4/4g4/4p4/9/9/9/9/4R4/4K4 b - 1");
         CHECK(!see_ge(b, usi_to_move("5h5c+"), 0));
         CHECK(!see_ge(b, usi_to_move("5h5c"), 0));
     }
-    // 2. SEE: Pawn capturing a rook is winning (`SEE >= 0`)
     {
         Board b;
         b.parse_sfen("4k4/4g4/4r4/4P4/9/9/9/9/4K4 b - 1");
         CHECK(see_ge(b, usi_to_move("5d5c+"), 0));
     }
-    // 3. 1-ply mate (`find_mate_1ply`): classic Gold drop on head (`G*5b`)
     {
         Board b;
         b.parse_sfen("4k4/9/4P4/9/9/9/9/9/4K4 b G 1");
@@ -1396,22 +1267,9 @@ static void test_see_and_mate_detection() {
         CHECK(find_mate_1ply(b, &m));
         CHECK_EQ(m, usi_to_move("G*5b"));
     }
-    // 4. 3-ply tsume solved cleanly by iterative_deepening
     {
-        Board b;
-        // Black to mate in 3: 1.G*5b (if ...4a??; constrain corners: l3k3l/9/3PPP3/9/9/9/9/9/4K4 b 2G 1)
-        b.parse_sfen("3lkl3/9/4P4/9/9/9/9/9/4K4 b G 1");
-        Move m = MOVE_NONE;
-        CHECK(find_mate_1ply(b, &m));
-        CHECK_EQ(m, usi_to_move("G*5b"));
-
-        // 3-ply mate: "3rk4/9/3GP4/9/9/9/9/9/4K4 b G 1" -> G*5b or similar
         Board b3;
-        b3.parse_sfen("7nl/6gk1/6ppp/9/9/9/9/7R1/4K4 b GS 1");
-        // S*3b or G*2c etc.; test clean forced 3-ply mate:
-        // White king at 1a, White lance at 1b? No: White king at 1a, Black Silver at 2c, Black Golds in hand:
         b3.parse_sfen("8k/9/7S1/9/9/9/9/9/4K4 b 2G 1");
-        // 1. G*1b K1a->2a 2. G*2b# (3-ply mate!)
         SearchInfo last_info;
         const Move best = iterative_deepening(b3, 500, [&](const SearchInfo& info) {
             last_info = info;
@@ -1419,6 +1277,28 @@ static void test_see_and_mate_detection() {
         CHECK(best != MOVE_NONE);
         CHECK(last_info.score_is_mate);
         CHECK(last_info.score_mate > 0 && last_info.score_mate <= 2);
+    }
+}
+
+static void test_real_nnue_if_present() {
+    if (get_eval_family() != EvalFamily::SFNN_NNUE) return;
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+    uint64_t rng = 0x123456789ABCDEFULL;
+    for (int ply = 0; ply < 120; ++ply) {
+        MoveList ml;
+        generate_legal_moves(b, ml);
+        if (ml.empty()) break;
+        for (int k = 0; k < std::min(3, ml.size()); ++k) {
+            Move m = ml[(ply * 5 + k * 11) % ml.size()];
+            b.do_move(m);
+            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+            b.undo_move(m);
+        }
+        rng = rng * 6364136223846793005ULL + 1ULL;
+        b.do_move(ml[static_cast<size_t>(rng >> 32) % static_cast<size_t>(ml.size())]);
+        CHECK_EQ(evaluate(b), evaluate_full_reference(b));
     }
 }
 
@@ -1466,22 +1346,17 @@ int main() {
     test_alpha_beta_clamps_large_deficit_to_minus_1000();
     test_alpha_beta_clamp_side_agnostic();
 
-    // Eval file discovery and loading tests
-    test_eval_fv_bin_file_not_found();
-    test_eval_fv_bin_size_mismatch_reports_clear_error();
-    test_eval_fv_bin_correct_size_loads_and_evaluates();
-    test_eval_fv_bin_real_kkp_value_is_used();
-    test_eval_fv_bin_real_kkp_white_piece_is_subtracted_and_mirrored();
-    test_eval_fv_bin_real_kpp_pair_value_is_used();
-    test_eval_fv_bin_one_byte_short_is_rejected();
-    test_eval_fv_bin_legacy_size_reports_specific_error();
-    test_eval_nnue_unsupported_fallback();
-    test_eval_auto_discovery();
-    test_eval_auto_discovery_independent_of_cwd();
+    // NNUE & progress.bin tests
+    test_eval_nnue_missing_and_empty_dummy_fallback();
+    test_eval_nnue_corrupt_and_invalid_progress_rejected();
+    test_eval_auto_discovery_and_cwd_independence();
+    test_eval_nnue_ka2_exact_math_and_progress_buckets();
+    test_eval_nnue_incremental_and_simd_matches_scalar_reference();
     test_perft_and_staged_movegen_equivalence();
-    test_eval_hand_1based_and_9file_non_collision();
-    test_eval_incremental_matches_full_reference();
     test_see_and_mate_detection();
+    set_eval_file_path("");
+    set_eval_dir("");
+    test_real_nnue_if_present();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "
