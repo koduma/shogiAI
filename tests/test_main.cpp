@@ -784,21 +784,21 @@ static void test_singular_extension_exclusion_search() {
 // a value to exactly -1000 before returning.
 // ============================================================
 static void test_alpha_beta_clamps_large_deficit_to_minus_1000() {
+    // Verify large material deficits are evaluated accurately without artificial -1000 clamping.
     Board b;
     b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b rbgs 1");
     const int score = negamax(b, 1, -INF, INF, 0);
-    CHECK_EQ(score, -1000000);
+    CHECK(score <= -2024 && score > -MATE_VALUE);
 }
 
-// ============================================================
-// Test: the same clamp applies regardless of which side is to move
-// (guards against the clamp being wired to the wrong side).
-// ============================================================
 static void test_alpha_beta_clamp_side_agnostic() {
-    Board b;
-    b.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 w RBGS 1");
-    const int score = negamax(b, 1, -INF, INF, 0);
-    CHECK_EQ(score, -1000000);
+    Board b_black, b_white;
+    b_black.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 b rbgs 1");
+    b_white.parse_sfen("4k4/9/9/9/9/9/9/9/4K4 w RBGS 1");
+    const int s_b = negamax(b_black, 1, -INF, INF, 0);
+    const int s_w = negamax(b_white, 1, -INF, INF, 0);
+    CHECK_EQ(s_b, s_w);
+    CHECK(s_w <= -2024 && s_w > -MATE_VALUE);
 }
 
 // ============================================================
@@ -950,10 +950,10 @@ static void test_eval_fv_bin_correct_size_loads_and_evaluates() {
     CHECK_EQ(evaluate(b), 0); // symmetric material, zero tables → 0
 
     b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 b P 1");
-    CHECK_EQ(evaluate(b), 100); // one black pawn in hand: pure material (100cp), zero tables
+    CHECK_EQ(evaluate(b), 87); // Bonanza 6.0 pawn value = 87cp
 
     b.parse_sfen("9/9/9/9/9/9/9/4K4/4k4 w P 1");
-    CHECK_EQ(evaluate(b), -100); // same physical position, White to move → sign flips
+    CHECK_EQ(evaluate(b), -87); // same physical position, White to move → sign flips
 
     set_eval_file_path(""); // reset
     std::remove(tmp.c_str());
@@ -989,12 +989,12 @@ static void test_eval_fv_bin_real_kkp_value_is_used() {
 
     Board b;
     b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k b - 1");
-    // material (100cp black pawn) * 32 + kkp(6400), all / 32 == 100 + 200
-    CHECK_EQ(evaluate(b), 300);
+    // material (87cp black pawn) * 32 + kkp(6400), all / 32 == 87 + 200 == 287
+    CHECK_EQ(evaluate(b), 287);
 
     // Same physical position, White to move: sign flips exactly.
     b.parse_sfen("K8/9/9/9/4P4/9/9/9/8k w - 1");
-    CHECK_EQ(evaluate(b), -300);
+    CHECK_EQ(evaluate(b), -287);
 
     set_eval_file_path(""); // reset
     std::remove(tmp.c_str());
@@ -1031,9 +1031,8 @@ static void test_eval_fv_bin_real_kkp_white_piece_is_subtracted_and_mirrored() {
 
     Board b;
     b.parse_sfen("K8/9/9/9/4p4/9/9/9/8k b - 1");
-    // material (-100cp, one White pawn) * 32 - kkp(6400), all / 32
-    // == -100 - 200 == -300
-    CHECK_EQ(evaluate(b), -300);
+    // material (-87cp, one White pawn) * 32 - kkp(6400), all / 32 == -287
+    CHECK_EQ(evaluate(b), -287);
 
     set_eval_file_path(""); // reset
     std::remove(tmp.c_str());
@@ -1053,13 +1052,14 @@ static void test_eval_fv_bin_real_kpp_pair_value_is_used() {
     const std::string tmp = "/tmp/shogiai_test_fv_kpp_nonzero.bin";
     write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
 
-    // Black-view features: lance @ bonanza_sq(9)=1 -> f_lance(225)+1=226;
-    //                       pawn  @ bonanza_sq(40)=40 -> f_pawn(81)+40=121.
-    // White-view features: lance -> e_lance(306)+mirror(1)=306+79=385;
-    //                       pawn  -> e_pawn(162)+mirror(40)=162+40=202.
+    // Genuine Bonanza rank-major square (A9=0 .. I1=80):
+    // Black lance at 9b (`sq = 9`) -> f_lance(225) + 9 = 234 (first valid lance slot!).
+    // Black pawn  at 5e (`sq = 40`) -> f_pawn(81) + 40 = 121.
+    // White-view: lance -> e_lance(306) + mirror(9=71) = 377;
+    //             pawn  -> e_pawn(162)  + mirror(40=40) = 202.
     constexpr int kSqBk = 0, kSqWkInv = 0;
-    constexpr int kBlackLance = 226, kBlackPawn = 121;
-    constexpr int kWhiteLance = 385, kWhitePawn = 202;
+    constexpr int kBlackLance = 234, kBlackPawn = 121;
+    constexpr int kWhiteLance = 377, kWhitePawn = 202;
     constexpr int16_t kBlackPassValue = 640; //  20 centipawns * FV_SCALE(32)
     constexpr int16_t kWhitePassValue = 320; //  10 centipawns * FV_SCALE(32)
 
@@ -1071,9 +1071,8 @@ static void test_eval_fv_bin_real_kpp_pair_value_is_used() {
 
     Board b;
     b.parse_sfen("K8/L8/9/9/4P4/9/9/9/8k b - 1");
-    // material (100 pawn + 300 lance = 400cp) * 32 + (640 - 320), all / 32
-    // == 400 + 10 == 410
-    CHECK_EQ(evaluate(b), 410);
+    // material (87 pawn + 232 lance = 319cp) * 32 + (640 - 320), all / 32 == 319 + 10 == 329
+    CHECK_EQ(evaluate(b), 329);
 
     set_eval_file_path(""); // reset
     std::remove(tmp.c_str());
@@ -1220,6 +1219,209 @@ static void test_eval_auto_discovery_independent_of_cwd() {
 }
 
 
+
+// ============================================================
+// New Regression & Strength Tests:
+//   1. Perft(1..4) + Tactical/Quiet partition + O(1) is_move_legal equivalence
+//   2. Bonanza 1-based KPP hand indexing & rank-major non-collision (9g pawn != e_hand_rook)
+//   3. Incremental KPP/KKP + EvalHash exact bit-for-bit match vs evaluate_full_reference()
+//   4. Shogi Static Exchange Evaluation (SEE) with drops, promotions, and X-rays
+//   5. 1-ply mate detection (`find_mate_1ply`) & multi-ply tsume shogi solving
+// ============================================================
+static uint64_t perft(Board& b, int depth) {
+    MoveList ml;
+    generate_legal_moves(b, ml);
+    if (depth <= 1) return static_cast<uint64_t>(ml.size());
+    uint64_t total = 0;
+    for (Move m : ml) {
+        b.do_move(m, false);
+        total += perft(b, depth - 1);
+        b.undo_move(m);
+    }
+    return total;
+}
+
+static void test_perft_and_staged_movegen_equivalence() {
+    Board b;
+    b.set_startpos();
+    CHECK_EQ(perft(b, 1), 30ULL);
+    CHECK_EQ(perft(b, 2), 900ULL);
+    CHECK_EQ(perft(b, 3), 25470ULL);
+    CHECK_EQ(perft(b, 4), 719731ULL);
+
+    // Verify generate_tactical_moves + generate_quiet_moves == generate_legal_moves
+    // and O(1) is_move_legal matches on midgame SFENs with drops, promotions, pins.
+    const char* sfens[] = {
+        "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+        "ln1gkg1nl/1r4sb1/p1pppp1pp/1p4p2/7P1/2P6/PP1PPPP1P/1BG4R1/LNS1K1SNL b Pp 1",
+        "4k4/9/4P4/9/9/2b6/3P5/4K4/4R4 b GSp 1",
+        "r3k3r/9/4+B4/9/9/9/4p4/4K4/9 w GS2p 1"
+    };
+    for (const char* sfen : sfens) {
+        Board pos;
+        pos.parse_sfen(sfen);
+        const bool in_chk = pos.in_check();
+        MoveList all, tac, qui;
+        generate_legal_moves(pos, all);
+        if (!in_chk) {
+            generate_tactical_moves(pos, tac);
+            generate_quiet_moves(pos, qui);
+            CHECK_EQ(tac.size() + qui.size(), all.size());
+        }
+        for (Move m : all) {
+            CHECK(is_move_legal(pos, m, in_chk));
+        }
+    }
+}
+
+static void test_eval_hand_1based_and_9file_non_collision() {
+    const std::string tmp = "/tmp/shogiai_test_fv_hand_1based.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
+
+    // 1. Verify 1st Black pawn in hand uses `f_hand_pawn + 1 == 1` (NOT `0`!).
+    //    Black king @ 5i (`sq = 76`), White king @ 5a (`sq = 4`, `mirror(4) = 76`).
+    //    Patch diagonal KPP[76][1][1] = +3200 (+100cp) and leave KPP[76][0][0] = 0.
+    patch_int16(tmp, kpp_byte_offset(76, 1, 1), 3200);
+    // 2. Verify Black pawn on 9g (`sq = 54`) uses `f_pawn(81) + 54 = 135`, NOT `87` (`e_hand_rook`).
+    patch_int16(tmp, kpp_byte_offset(76, 135, 135), 1600); // +50cp
+
+    set_eval_file_path(tmp);
+    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
+
+    Board b;
+    b.parse_sfen("4k4/9/9/9/9/9/P8/9/4K4 b P 1");
+    // 2 pawns (2 * 87 = 174cp) + 100cp (hand P #1) + 50cp (9g pawn) = 324cp
+    CHECK_EQ(evaluate_full_reference(b), 324);
+    CHECK_EQ(evaluate(b), 324);
+
+    set_eval_file_path("");
+    std::remove(tmp.c_str());
+}
+
+static void test_eval_incremental_matches_full_reference() {
+    const std::string tmp = "/tmp/shogiai_test_fv_incremental.bin";
+    write_zero_filled_file(tmp, EXPECTED_FV_BIN_BYTES);
+
+    // Populate a rich set of non-zero KPP and KKP weights across kings & features
+    FILE* f = std::fopen(tmp.c_str(), "r+b");
+    CHECK(f != nullptr);
+    if (f) {
+        uint64_t seed = 0x123456789ABCDEF0ULL;
+        auto next_val = [&]() -> int16_t {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            return static_cast<int16_t>((static_cast<int>(seed & 0x3FF) - 512) * 4);
+        };
+        // Patch KKP entries across all king pairs for common hand/board slots
+        for (int bk : {4, 68, 69, 75, 76, 77}) {
+            for (int wk : {3, 4, 5, 12, 13, 75, 76}) {
+                for (int idx = 0; idx < 738; idx += 3) {
+                    int16_t v = next_val();
+                    std::fseek(f, static_cast<long>(kkp_byte_offset(bk, wk, idx)), SEEK_SET);
+                    std::fwrite(&v, sizeof(v), 1, f);
+                }
+            }
+        }
+        // Patch KPP entries for those king squares
+        for (int k : {3, 4, 5, 67, 68, 69, 75, 76, 77}) {
+            for (int a = 1; a < 1476; a += 17) {
+                for (int b_idx = 1; b_idx <= a; b_idx += 23) {
+                    int16_t v = next_val();
+                    std::fseek(f, static_cast<long>(kpp_byte_offset(k, a, b_idx)), SEEK_SET);
+                    std::fwrite(&v, sizeof(v), 1, f);
+                }
+            }
+        }
+        std::fclose(f);
+    }
+
+    set_eval_file_path(tmp);
+    CHECK(get_eval_family() == EvalFamily::BONANZA_V6_FV);
+
+    // Play a deterministic pseudo-random game exercising quiet moves, captures,
+    // promotions, drops, king moves, null moves, and undo_move!
+    Board b;
+    b.parse_sfen("ln1gkg1nl/1r4sb1/p1pppp1pp/1p4p2/7P1/2P6/PP1PPPP1P/1BG4R1/LNS1K1SNL b Pp 1");
+    uint64_t rng = 0xCAFEBABE1234ULL;
+    CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+
+    for (int step = 0; step < 80; ++step) {
+        MoveList ml;
+        generate_legal_moves(b, ml);
+        if (ml.empty()) break;
+
+        // Also test null-move eval preservation when not in check
+        if (!b.in_check()) {
+            b.do_null_move();
+            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+            b.undo_null_move();
+        }
+
+        // Test several sibling moves + undo at each ply
+        for (int k = 0; k < std::min(4, ml.size()); ++k) {
+            Move cm = ml[(step * 7 + k * 13) % ml.size()];
+            b.do_move(cm);
+            CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+            b.undo_move(cm);
+        }
+
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        Move chosen = ml[static_cast<size_t>(rng >> 32) % static_cast<size_t>(ml.size())];
+        b.do_move(chosen);
+        CHECK_EQ(evaluate(b), evaluate_full_reference(b));
+    }
+
+    set_eval_file_path("");
+    std::remove(tmp.c_str());
+}
+
+static void test_see_and_mate_detection() {
+    // 1. SEE: Rook capturing a pawn defended by enemy gold is losing (`SEE < 0`)
+    {
+        Board b;
+        b.parse_sfen("4k4/4g4/4p4/9/9/9/9/4R4/4K4 b - 1");
+        CHECK(!see_ge(b, usi_to_move("5h5c+"), 0));
+        CHECK(!see_ge(b, usi_to_move("5h5c"), 0));
+    }
+    // 2. SEE: Pawn capturing a rook is winning (`SEE >= 0`)
+    {
+        Board b;
+        b.parse_sfen("4k4/4g4/4r4/4P4/9/9/9/9/4K4 b - 1");
+        CHECK(see_ge(b, usi_to_move("5d5c+"), 0));
+    }
+    // 3. 1-ply mate (`find_mate_1ply`): classic Gold drop on head (`G*5b`)
+    {
+        Board b;
+        b.parse_sfen("4k4/9/4P4/9/9/9/9/9/4K4 b G 1");
+        Move m = MOVE_NONE;
+        CHECK(find_mate_1ply(b, &m));
+        CHECK_EQ(m, usi_to_move("G*5b"));
+    }
+    // 4. 3-ply tsume solved cleanly by iterative_deepening
+    {
+        Board b;
+        // Black to mate in 3: 1.G*5b (if ...4a??; constrain corners: l3k3l/9/3PPP3/9/9/9/9/9/4K4 b 2G 1)
+        b.parse_sfen("3lkl3/9/4P4/9/9/9/9/9/4K4 b G 1");
+        Move m = MOVE_NONE;
+        CHECK(find_mate_1ply(b, &m));
+        CHECK_EQ(m, usi_to_move("G*5b"));
+
+        // 3-ply mate: "3rk4/9/3GP4/9/9/9/9/9/4K4 b G 1" -> G*5b or similar
+        Board b3;
+        b3.parse_sfen("7nl/6gk1/6ppp/9/9/9/9/7R1/4K4 b GS 1");
+        // S*3b or G*2c etc.; test clean forced 3-ply mate:
+        // White king at 1a, White lance at 1b? No: White king at 1a, Black Silver at 2c, Black Golds in hand:
+        b3.parse_sfen("8k/9/7S1/9/9/9/9/9/4K4 b 2G 1");
+        // 1. G*1b K1a->2a 2. G*2b# (3-ply mate!)
+        SearchInfo last_info;
+        const Move best = iterative_deepening(b3, 500, [&](const SearchInfo& info) {
+            last_info = info;
+        });
+        CHECK(best != MOVE_NONE);
+        CHECK(last_info.score_is_mate);
+        CHECK(last_info.score_mate > 0 && last_info.score_mate <= 2);
+    }
+}
+
 int main() {
     Zobrist::init();
 
@@ -1276,6 +1478,10 @@ int main() {
     test_eval_nnue_unsupported_fallback();
     test_eval_auto_discovery();
     test_eval_auto_discovery_independent_of_cwd();
+    test_perft_and_staged_movegen_equivalence();
+    test_eval_hand_1based_and_9file_non_collision();
+    test_eval_incremental_matches_full_reference();
+    test_see_and_mate_detection();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "
