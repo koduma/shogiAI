@@ -1,3 +1,12 @@
+// Workaround for MinGW-w64 GCC Bug 65782 / 54412:
+// `-march=native` on AVX-512 CPUs emits `.seh_savexmm %xmm16..31` (rejected by GNU as on Win64 SEH)
+// and 64-byte ZMM stack spills. Disable AVX-512 on MinGW GCC while keeping full AVX2/FMA/BMI2 active.
+#if (defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)) || defined(SHOGIAI_FORCE_NO_AVX512_TEST)
+#pragma GCC target("no-avx512f,no-avx512vl,no-avx512bw,no-avx512dq,no-avx512cd")
+#ifndef SHOGIAI_NO_AVX512
+#define SHOGIAI_NO_AVX512 1
+#endif
+#endif
 #include "board.hpp"
 #include <iostream>
 #include <sstream>
@@ -44,6 +53,60 @@ Board::Board() {
     history_.reserve(256);
     pos_hashes_.reserve(512);
     reset();
+}
+
+Board::Board(const Board& o)
+    : stm_(o.stm_),
+      ply_(o.ply_),
+      hash_(o.hash_),
+      material_black_(o.material_black_),
+      history_(o.history_),
+      pos_hashes_(o.pos_hashes_) {
+    std::memcpy(board_, o.board_, sizeof(board_));
+    std::memcpy(hand_, o.hand_, sizeof(hand_));
+    std::memcpy(king_sq_, o.king_sq_, sizeof(king_sq_));
+}
+
+Board::Board(Board&& o) noexcept
+    : stm_(o.stm_),
+      ply_(o.ply_),
+      hash_(o.hash_),
+      material_black_(o.material_black_),
+      history_(std::move(o.history_)),
+      pos_hashes_(std::move(o.pos_hashes_)) {
+    std::memcpy(board_, o.board_, sizeof(board_));
+    std::memcpy(hand_, o.hand_, sizeof(hand_));
+    std::memcpy(king_sq_, o.king_sq_, sizeof(king_sq_));
+}
+
+Board& Board::operator=(const Board& o) {
+    if (this != &o) {
+        std::memcpy(board_, o.board_, sizeof(board_));
+        std::memcpy(hand_, o.hand_, sizeof(hand_));
+        stm_ = o.stm_;
+        ply_ = o.ply_;
+        std::memcpy(king_sq_, o.king_sq_, sizeof(king_sq_));
+        hash_ = o.hash_;
+        material_black_ = o.material_black_;
+        history_ = o.history_;
+        pos_hashes_ = o.pos_hashes_;
+    }
+    return *this;
+}
+
+Board& Board::operator=(Board&& o) noexcept {
+    if (this != &o) {
+        std::memcpy(board_, o.board_, sizeof(board_));
+        std::memcpy(hand_, o.hand_, sizeof(hand_));
+        stm_ = o.stm_;
+        ply_ = o.ply_;
+        std::memcpy(king_sq_, o.king_sq_, sizeof(king_sq_));
+        hash_ = o.hash_;
+        material_black_ = o.material_black_;
+        history_ = std::move(o.history_);
+        pos_hashes_ = std::move(o.pos_hashes_);
+    }
+    return *this;
 }
 
 void Board::reset() {

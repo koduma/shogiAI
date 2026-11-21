@@ -42,6 +42,10 @@ public:
     std::vector<uint64_t>  pos_hashes_;    // all hashes seen (for repetition)
 
     Board();
+    Board(const Board& o);
+    Board(Board&& o) noexcept;
+    Board& operator=(const Board& o);
+    Board& operator=(Board&& o) noexcept;
 
     // Position setup
     void reset      ();

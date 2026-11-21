@@ -1,3 +1,12 @@
+// Workaround for MinGW-w64 GCC Bug 65782 / 54412:
+// `-march=native` on AVX-512 CPUs emits `.seh_savexmm %xmm16..31` (rejected by GNU as on Win64 SEH)
+// and 64-byte ZMM stack spills. Disable AVX-512 on MinGW GCC while keeping full AVX2/FMA/BMI2 active.
+#if (defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)) || defined(SHOGIAI_FORCE_NO_AVX512_TEST)
+#pragma GCC target("no-avx512f,no-avx512vl,no-avx512bw,no-avx512dq,no-avx512cd")
+#ifndef SHOGIAI_NO_AVX512
+#define SHOGIAI_NO_AVX512 1
+#endif
+#endif
 #include "board.hpp"
 #include "movegen.hpp"
 #include "search.hpp"
@@ -7,6 +16,7 @@
 #include <string>
 #include <algorithm>
 #include <future>
+#include <memory>
 #include <thread>
 #include <utility>
 
@@ -157,12 +167,12 @@ int main() {
             std::cout << "info string " << eval_status_message() << "\n";
             std::cout.flush();
 
-            Board search_board = board;
+            auto search_board = std::make_unique<Board>(board);
             std::promise<void> started;
             std::future<void> search_started = started.get_future();
             search_thread = std::thread([search_board = std::move(search_board), budget, depth_limit,
                                          started = std::move(started)]() mutable {
-                Move best = iterative_deepening_timed(search_board, budget, [](const SearchInfo& info) {
+                Move best = iterative_deepening_timed(*search_board, budget, [](const SearchInfo& info) {
                     std::cout << "info depth " << info.depth
                               << " seldepth " << info.seldepth
                               << " time " << info.time_ms

@@ -1,3 +1,12 @@
+// Workaround for MinGW-w64 GCC Bug 65782 / 54412:
+// `-march=native` on AVX-512 CPUs emits `.seh_savexmm %xmm16..31` (rejected by GNU as on Win64 SEH)
+// and 64-byte ZMM stack spills. Disable AVX-512 on MinGW GCC while keeping full AVX2/FMA/BMI2 active.
+#if (defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)) || defined(SHOGIAI_FORCE_NO_AVX512_TEST)
+#pragma GCC target("no-avx512f,no-avx512vl,no-avx512bw,no-avx512dq,no-avx512cd")
+#ifndef SHOGIAI_NO_AVX512
+#define SHOGIAI_NO_AVX512 1
+#endif
+#endif
 #include "eval.hpp"
 #include <algorithm>
 #include <array>
@@ -323,13 +332,42 @@ inline int yo_folded_board_feature(Color view, Piece p, Square s) {
 // Model Data Structures
 // -----------------------------------------------------------------------
 struct SfnnLayerStack {
-    alignas(16) int32_t fc0_b[8]{};
+    alignas(16) int32_t fc0_b[8];
     AlignedBuffer<int8_t> fc0_w;            // [8 * half_dims], row-major [out][in]
-    alignas(16) int32_t fc1_b[64]{};
-    alignas(16) int8_t  fc1_w_packed[64 * 16]{}; // active 16 cols per output row
-    alignas(16) int8_t  fc1_w_raw32[64 * 32]{};  // full 32 cols from file (for reference check)
-    int32_t             fc2_b = 0;
-    alignas(16) int8_t  fc2_w[64]{};
+    alignas(16) int32_t fc1_b[64];
+    alignas(16) int8_t  fc1_w_packed[64 * 16]; // active 16 cols per output row
+    alignas(16) int8_t  fc1_w_raw32[64 * 32];  // full 32 cols from file (for reference check)
+    int32_t             fc2_b;
+    alignas(16) int8_t  fc2_w[64];
+
+    SfnnLayerStack() noexcept : fc0_w(), fc2_b(0) {
+        std::memset(fc0_b, 0, sizeof(fc0_b));
+        std::memset(fc1_b, 0, sizeof(fc1_b));
+        std::memset(fc1_w_packed, 0, sizeof(fc1_w_packed));
+        std::memset(fc1_w_raw32, 0, sizeof(fc1_w_raw32));
+        std::memset(fc2_w, 0, sizeof(fc2_w));
+    }
+    SfnnLayerStack(const SfnnLayerStack&) = delete;
+    SfnnLayerStack& operator=(const SfnnLayerStack&) = delete;
+    SfnnLayerStack(SfnnLayerStack&& o) noexcept : fc0_w(std::move(o.fc0_w)), fc2_b(o.fc2_b) {
+        std::memcpy(fc0_b, o.fc0_b, sizeof(fc0_b));
+        std::memcpy(fc1_b, o.fc1_b, sizeof(fc1_b));
+        std::memcpy(fc1_w_packed, o.fc1_w_packed, sizeof(fc1_w_packed));
+        std::memcpy(fc1_w_raw32, o.fc1_w_raw32, sizeof(fc1_w_raw32));
+        std::memcpy(fc2_w, o.fc2_w, sizeof(fc2_w));
+    }
+    SfnnLayerStack& operator=(SfnnLayerStack&& o) noexcept {
+        if (this != &o) {
+            std::memcpy(fc0_b, o.fc0_b, sizeof(fc0_b));
+            fc0_w = std::move(o.fc0_w);
+            std::memcpy(fc1_b, o.fc1_b, sizeof(fc1_b));
+            std::memcpy(fc1_w_packed, o.fc1_w_packed, sizeof(fc1_w_packed));
+            std::memcpy(fc1_w_raw32, o.fc1_w_raw32, sizeof(fc1_w_raw32));
+            fc2_b = o.fc2_b;
+            std::memcpy(fc2_w, o.fc2_w, sizeof(fc2_w));
+        }
+        return *this;
+    }
 };
 
 struct SfnnModel {
@@ -922,7 +960,7 @@ inline void simd_copy_i16(int16_t* dst, const int16_t* src, int dims) {
 
 inline void simd_add_inplace_i16(int16_t* acc, const int16_t* w, int dims) {
     int j = 0;
-#if defined(__AVX512BW__)
+#if defined(__AVX512BW__) && !defined(SHOGIAI_NO_AVX512)
     for (; j + 32 <= dims; j += 32) {
         __m512i a = _mm512_loadu_si512(acc + j);
         __m512i b = _mm512_loadu_si512(w + j);
@@ -951,7 +989,7 @@ inline void simd_add_inplace_i16(int16_t* acc, const int16_t* w, int dims) {
 inline void simd_sub1_add1_i16(int16_t* dst, const int16_t* src,
                                const int16_t* rem0, const int16_t* add0, int dims) {
     int j = 0;
-#if defined(__AVX512BW__)
+#if defined(__AVX512BW__) && !defined(SHOGIAI_NO_AVX512)
     for (; j + 64 <= dims; j += 64) {
         __m512i s0 = _mm512_loadu_si512(src + j);
         __m512i r0 = _mm512_loadu_si512(rem0 + j);
@@ -992,7 +1030,7 @@ inline void simd_sub2_add2_i16(int16_t* dst, const int16_t* src,
                                const int16_t* rem0, const int16_t* rem1,
                                const int16_t* add0, const int16_t* add1, int dims) {
     int j = 0;
-#if defined(__AVX512BW__)
+#if defined(__AVX512BW__) && !defined(SHOGIAI_NO_AVX512)
     for (; j + 32 <= dims; j += 32) {
         __m512i v = _mm512_loadu_si512(src + j);
         v = _mm512_sub_epi16(v, _mm512_loadu_si512(rem0 + j));
@@ -1088,7 +1126,7 @@ int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int in
     __m256i acc5 = _mm256_setzero_si256();
     __m256i acc6 = _mm256_setzero_si256();
     __m256i acc7 = _mm256_setzero_si256();
-#if !(defined(__AVX512VNNI__) && defined(__AVX512VL__))
+#if !(defined(__AVX512VNNI__) && defined(__AVX512VL__) && !defined(SHOGIAI_NO_AVX512))
     const __m256i ones16 = _mm256_set1_epi16(1);
 #endif
 
@@ -1104,7 +1142,7 @@ int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int in
     for (int i = 0; i < input_dims; i += 32) {
         const __m256i u = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tf + i));
         if (_mm256_testz_si256(u, u)) continue;
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && !defined(SHOGIAI_NO_AVX512)
         acc0 = _mm256_dpbusd_epi32(acc0, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i)));
         acc1 = _mm256_dpbusd_epi32(acc1, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i)));
         acc2 = _mm256_dpbusd_epi32(acc2, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i)));
