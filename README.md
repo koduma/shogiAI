@@ -1,80 +1,75 @@
 # ShogiAI
 
-C++17 で実装された USI プロトコル対応の将棋エンジンです。評価関数部には [やねうらおのFANBOX「つようら王11mini/microを無料公開」](https://yaneurao.fanbox.cc/posts/12761272)（[公式サイト解説記事](https://yaneuraou.yaneu.com/2026/10/14/tsuyou-11-mini-micro-released-under-mit-license/)）で MIT License 公開された **つようら王11mini**（`SFNN_ka2_4096_8_64_progress8`: `nn.bin` + `progress.bin`）アーキテクチャを採用し、[やねうら王 (YaneuraOu)](https://github.com/yaneurao/YaneuraOu) 準拠の探索部（4-way クラスタ置換表、段階的 `MovePicker`、駒台スイング込み SEE、1手詰め判定、王手延長、1手/2手 Continuation History 等）と組み合わせています。
+C++17 で実装された USI プロトコル対応の将棋エンジンおよび勝率定跡システムです。評価関数部には [やねうらおのFANBOX「つようら王11mini/microを無料公開」](https://yaneurao.fanbox.cc/posts/12761272)（[公式サイト解説記事](https://yaneuraou.yaneu.com/2026/10/14/tsuyou-11-mini-micro-released-under-mit-license/)）で MIT License 公開された **つようら王11mini**（`SFNN_ka2_4096_8_64_progress8`: `nn.bin` + `progress.bin`）アーキテクチャを採用し、[やねうら王 (YaneuraOu)](https://github.com/yaneurao/YaneuraOu) 準拠の Lazy SMP 並列探索部および **水匠5・やねうら王へそのままexe差し替え可能な勝率定跡生成・運用システム**を備えています。
 
 ## 主な機能・特徴
 
 | 領域 | 実装内容 |
 |---|---|
-| **評価関数 (`nn.bin` + `progress.bin`)** | [YaneuraOu `evaluate_nnue.cpp`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/nnue/evaluate_nnue.cpp) 互換の `SFNNWithoutPsqt` (`Features=K-A2(Friend)[1791->4096x2],Network=SFNN-4096{LayerStack=8}`, `COMPRESSED_LEB128` 展開対応, 最適 `FV_SCALE=24`)、`progress.bin`（`81×1548` 倍精度KPロジスティック回帰・Q16固定小数点）による8段階 LayerStack 選択、玉プレーン事前畳み込みによる全合法手1〜2要素差分更新、AVX-512 VNNI / AVX2 / SSE2 SIMD ベクトル化、`EvalHash` キャッシュ |
-| **ルール・合法手生成** | 9×9盤面、全駒種・成り・打ち、二歩・行き所のない駒・打ち歩詰め判定、玉との直線ピン判定による `do_move` 不要の高速合法手生成、戦術手／静かな手／静かな王手の段階別生成 |
-| **探索部** | 反復深化 + Aspiration Window、PVS、64B アライン 4-way クラスタ置換表（静的評価値キャッシュ・世代管理）、段階的 `MovePicker`、SEE（静的交換評価）、1手詰め判定（`mate1ply`）、王手延長・Singular Extension（Multi-Cut 付き）、IIR・RFP・Razoring・検証付き NMP・Futility・LMP・SEE 枝刈り・履歴連動 LMR、静止探索初手の安全な王手生成 |
-| **学習履歴・順序付け** | 手番別 Main/Drop History、Capture History、Countermove、1-ply & 2-ply Continuation History |
-| **USI・進行度連動時間管理** | `usi`, `isready`, `setoption` (`USI_Hash`, `EvalDir`, `EvalFile`, `ProgressFile`, `FV_SCALE`), `usinewgame`, `position`, `go` (`btime`/`wtime`/`binc`/`winc`/`byoyomi`/`movetime`/`depth`/`infinite`), `stop`, `quit`、`progress.bin` の学習済み進行度と最善手安定度に応じたソフト／ハード時間制御 |
+| **盤面・合法手生成部（完全ビットボード）** | [やねうら王](https://github.com/yaneurao/YaneuraOu) 流の 128-bit `Bitboard`（SSE2/SSE4.1/BMI1/BMI2 PEXT対応）、L1/L2常駐型飛角香スライダー利きテーブル（内側63マス集約 `mid63`）、王手駒 `checkers_` 差分管理、遅延ピン・空き王手ブロッカー一括計算（`slider_blockers`）、`do_move` 不要の合法手・王手回避生成、O(1)二歩マスク、4サイクル王手判定、X-ray対応ビットボード `see_ge`、ターゲットマスク型高速1手詰め `find_mate_1ply`（`perft(5)` 約2.03億nps） |
+| **評価関数 (`nn.bin` + `progress.bin`)** | [YaneuraOu `evaluate_nnue.cpp`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/nnue/evaluate_nnue.cpp) 互換の `SFNNWithoutPsqt` (`Features=K-A2(Friend)[1791->4096x2],Network=SFNN-4096{LayerStack=8}`, `COMPRESSED_LEB128` 展開対応, 最適 `FV_SCALE=24`)、`progress.bin`（`81×1548` 倍精度KPロジスティック回帰・Q16固定小数点）による8段階 LayerStack 選択、玉プレーン事前畳み込み＋Plyインデックス型アキュムレータスタック（ルートシード付き）による全合法手1〜2要素差分更新、`fc0` 32Bインターリーブ＋4倍アンロール AVX2 / SSE2 SIMD ベクトル化、スレッド独立 `EvalHash` キャッシュ |
+| **並列探索・`nodelimit`** | SplitMix64 XOR ロックフリー 4-way クラスタ置換表、Lazy SMP マルチスレッド並列探索（`Threads`）、全スレッド合算ノード数を厳密制限するアトミック `nodelimit`、段階的 `MovePicker`、SEE、1手詰め判定、Singular Extension、IIR・RFP・NMP・LMP・LMR |
+| **勝率定跡生成部 (`winrate_book_gen`)** | 平手初形から最大200手までビームサーチを実行。先手視点評価値 `+600` 以上は `(hash, 1.0)`・`-600` 以下は `(hash, 0.0)` を記録して枝刈りし、`-600〜+600` は1局10秒以内の自己対局100局で先手勝率を記録して分岐、次世代ノード選択では `winrate_book.db` 未登録ノードを最優先し、次に先手視点評価値（先手番＝降順ソート、後手番＝昇順ソート）でビーム幅以下に絞って1手ごとに `winrate_book.db` をアトミック更新（複数回実行・`--runs <R>` 対応） |
+| **勝率定跡運用部 (`winrate_book_player`)** | ShogiGUI に1つ登録するだけで動作する USI プロキシエンジン。定跡内は `winrate_book.db` を DAG minimax 探索して勝率表示＋即時着手し、定跡外では `shogi_engine.exe` や **水匠5（やねうら王）** へ透過的に指し継ぎ |
+| **水匠5 / やねうら王 差し替え自動適応** | 起動時の `usi` 応答から子エンジンの対応オプションを自動判別し、水匠5の内蔵定跡（`USI_OwnBook=false`, `BookMoves=0`, `BookFile=no_book`）自動抑止、ローカルパイプ生成時の `NetworkDelay=0` / `MinimumThinkingTime=1` 自動最適化、`nodelimit` ⇔ `NodesLimit` 自動変換、入玉宣言勝ち（`bestmove win`）および同フォルダ `.exe` 自動検出に対応 |
 
-## ビルド方法
+## Windows (MinGW-w64) ビルド方法（別PC持ち運び対応 `-static`）
 
-### g++ 直接ビルド（Windows / Linux / macOS）
-
-NNUE（`4096×2` アキュムレータ + `int8` 行列積）の性能を最大限に引き出すため、`-O3 -march=native` の付与を推奨します。
-
-```bash
-# Linux / macOS
-g++ -std=c++17 -O3 -march=native -Wall -Wextra src/main.cpp src/board.cpp src/movegen.cpp src/eval.cpp src/search.cpp -Isrc -lpthread -o shogi_engine
-
-# Windows (MinGW-w64)
-g++ -std=c++17 -O3 -march=native -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -lpthread -o shogi_engine.exe
-
+```bat
+REM ① 通常の将棋AI本体 (shogi_engine.exe)
 g++ -std=c++17 -O3 -mavx2 -mfma -mbmi2 -mpopcnt -Wall -Wextra src\main.cpp src\board.cpp src\movegen.cpp src\eval.cpp src\search.cpp -Isrc -static -lpthread -o shogi_engine.exe
 
+REM ② 勝率定跡生成部 (winrate_book_gen.exe)
+g++ -std=c++17 -O3 -mavx2 -mfma -mbmi2 -mpopcnt -Wall -Wextra src\book_gen_main.cpp src\board.cpp src\movegen.cpp src\usi_proc.cpp src\winrate_book.cpp -Isrc -static -lpthread -o winrate_book_gen.exe
+
+REM ③ 勝率定跡運用部・ShogiGUI登録用プロキシエンジン (winrate_book_player.exe)
+g++ -std=c++17 -O3 -mavx2 -mfma -mbmi2 -mpopcnt -Wall -Wextra src\book_player_main.cpp src\board.cpp src\movegen.cpp src\usi_proc.cpp src\winrate_book.cpp -Isrc -static -lpthread -o winrate_book_player.exe
 ```
 
-### CMake ビルド（デフォルトで Release `-O3` および `-march=native` 自動検出が有効）
+### CMake ビルド（Linux / macOS / Windows）
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-
-# 単体テスト（Perft・SFNN差分評価/SIMDビット完全一致検証・progressバケット検証・SEE・詰み探索）
 ./build/shogi_tests
 ```
 
 ## 評価関数ファイル（`nn.bin` / `progress.bin`）の配置
 
-リポジトリ同梱の `src/eval/nn.bin` および `src/eval/progress.bin` は **0バイト（空）のダミーファイル** です（空ファイル時は自動的に安全な駒割評価 `MATERIAL_FALLBACK` として動作します）。[やねうらおのFANBOX](https://yaneurao.fanbox.cc/posts/12761272) からダウンロードした実ファイル（つようら王11mini `nn.bin`: `7,711,372` bytes、つようら王11micro `nn.bin`: `2048×2` 版も自動判別対応、`progress.bin`: `1,003,104` bytes）を以下のいずれかの方法で配置してください：
+リポジトリ同梱の `src/eval/nn.bin` および `src/eval/progress.bin` は **0バイト（空）のダミーファイル** です。
+* **付属の `shogi_engine.exe` を使う場合**: [やねうらおのFANBOX](https://yaneurao.fanbox.cc/posts/12761272) のつようら王11mini `nn.bin` と `progress.bin` を実行ファイル横の `eval/` フォルダに配置してください。
+* **水匠5のエンジン `.exe` に差し替える場合**: 水匠5の `.exe` と水匠5の `eval/nn.bin` を使います（追加設定不要で自動認識されます）。
 
-1. `src/eval/nn.bin` と `src/eval/progress.bin`（または実行ファイル横の `eval/nn.bin` と `eval/progress.bin`）に上書き配置（自動検出）
-2. USI オプション `setoption name EvalDir value /path/to/eval_dir`（または `EvalFile` / `ProgressFile` 個別指定）
-3. 環境変数 `SHOGIAI_EVAL_DIR=/path/to/eval_dir`（または `SHOGIAI_EVAL_FILE` / `SHOGIAI_PROGRESS_FILE`）
+## 勝率定跡の生成と ShogiGUI での運用（`shogi_engine.exe` / 水匠5 両対応）
 
-### `nn.bin` / `progress.bin` アーキテクチャ仕様
+### 1. 水匠5への差し替え方法（以下のいずれでも追加設定なしでそのまま動作）
 
-本エンジンの評価関数ローダ・推論器は、[YaneuraOu `evaluate_nnue.cpp`](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/nnue/evaluate_nnue.cpp)、[やねうら王の更新履歴2026](https://github.com/yaneurao/YaneuraOu/wiki/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E3%81%AE%E6%9B%B4%E6%96%B0%E5%B1%A5%E6%AD%B42026)、[yaneurao/BulletOu](https://github.com/yaneurao/BulletOu)、および [SH11235/tatara `dense-qat.md`](https://github.com/SH11235/tatara/blob/main/docs/dense-qat.md) の仕様に完全準拠しています：
+1. **リネーム差し替え**: `shogi_engine.exe` を水匠5の `.exe`（リネームして `shogi_engine.exe`）＋水匠5の `eval` フォルダに置き換える
+2. **同フォルダ配置（リネームすら不要）**: `shogi_engine.exe` を消して、同じフォルダに水匠5の `.exe`（例: `YaneuraOu-by-gcc.exe`）と水匠5の `eval` フォルダを置く（自動検出されます）
+3. **別フォルダ直接指定**: 水匠5フォルダは一切触らず、`winrate_book_gen.exe --engine "C:\...\YaneuraOu-by-gcc.exe"` や ShogiGUI の `ChildEnginePath` に水匠5のフルパスを指定する（水匠5側の `book` フォルダ退避や `NetworkDelay` 変更もすべて自動で行われます）
 
-| ファイル / 層 | 型・圧縮形式 | 形状・構造 | 内容 |
-|---|---|---|---|
-| `nn.bin` Header | `uint32_t` × 3 + ASCII | `version=0x7af32f16` | `ModelType=SFNNWithoutPsqt;Features=K-A2(Friend)[1791->4096x2],Network=SFNN-4096{LayerStack=8}` |
-| FeatureTransformer | `COMPRESSED_LEB128` (`int16_t`) | Bias `[4096]`, Weight `[1791][4096]` | YaneuraOu 筋優先座標（`1一=0 .. 9九=80`）の `BonaPiece` (`0..1547`) + `A2` 両玉共通面 (`1548..1628`) + 自玉面 (`1629..1709`) + 敵玉面 (`1710..1790`)。Pairwise 乗算 `(clamp(a,0,127)*clamp(b,0,127))>>7` により `4096` 次元 `uint8_t` を出力 |
-| LayerStack `0..7` (`fc0`→`fc1`→`fc2`) | `int32_t` bias + `int8_t` weight | `4096 → 8 (Dual: Sqr+Lin=16) → 64 → 1` | `SqrClippedReLU` (`(z*z)>>19`) と `ClippedReLU` (`z>>6`) の2系統結合（`H1=8` のため skip なし）、最終出力 `clamp(out / FV_SCALE, -30000, 30000)` |
-| `progress.bin` | 生 IEEE-754 `double` | `81 × 1,548` (`1,003,104` bytes) | Q16 整数化（`×65536`）した KP 進行度重み。対数オッズ閾値 `log((i/8)/(1-i/8))` により 8 個の LayerStack バケットを選択 |
+### 2. 勝率定跡DB（`winrate_book.db`）の生成
 
-## USI オプション一覧
+```bat
+REM デフォルト（shogi_engine.exe または同フォルダの水匠5を自動検出）
+winrate_book_gen.exe --engine shogi_engine.exe --book winrate_book.db --beam-width 8 --max-ply 200 --games 100 --game-limit-ms 40000 --rollout-nodes 320000 --branch-nodes 12800000 --eval-nodes 12800000 --workers 1 --threads 4 --hash-mb 1024
 
-| オプション名 | 型 | デフォルト | 説明 |
-|---|---|---|---|
-| `USI_Hash` | `spin` | `64` (MiB) | 4-way クラスタ置換表のメモリサイズ（4〜2048 MiB） |
-| `EvalDir` | `string` | `eval` | `nn.bin` と `progress.bin` を格納したフォルダパス |
-| `EvalFile` | `string` | `eval/nn.bin` | `nn.bin` の個別ファイルパス |
-| `ProgressFile` | `string` | `eval/progress.bin` | `progress.bin` の個別ファイルパス |
-| `FV_SCALE` | `spin` | `24` | 評価値スケーリング除数（[つようら王11mini 公式推奨値 `24`](https://yaneurao.fanbox.cc/posts/12761272)） |
+REM 別フォルダの水匠5を直接指定する場合
+winrate_book_gen.exe --engine "C:\engines\Suisho5\YaneuraOu-by-gcc.exe" --book winrate_book.db --beam-width 8 --max-ply 200 --games 100 --game-limit-ms 10000
+```
 
-## 参照プロジェクト・文献
+* 平手ルートから最大200手までビームサーチを行い、1手進めるごとに `winrate_book.db`（`0x<16桁Zobristハッシュ>,<先手勝率0.0〜1.0>`）をアトミック更新します（中断後の自動再開対応）。
 
-* [やねうらおのFANBOX「つようら王11mini/microを無料公開」](https://yaneurao.fanbox.cc/posts/12761272) / [やねうら王公式サイト記事](https://yaneuraou.yaneu.com/2026/10/14/tsuyou-11-mini-micro-released-under-mit-license/)
-* [yaneurao/YaneuraOu](https://github.com/yaneurao/YaneuraOu) / [やねうら王の更新履歴2026](https://github.com/yaneurao/YaneuraOu/wiki/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E3%81%AE%E6%9B%B4%E6%96%B0%E5%B1%A5%E6%AD%B42026)
-* [yaneurao/BulletOu](https://github.com/yaneurao/BulletOu) / [SH11235/tatara](https://github.com/SH11235/tatara)
-* [Bonanza (Wikipedia)](https://ja.wikipedia.org/wiki/Bonanza) / [HiraokaTakuya/apery](https://github.com/HiraokaTakuya/apery)
+### 3. ShogiGUI でのエンジン設定方法
+
+* ShogiGUI の **「ツール」→「エンジン設定」→「追加」では `winrate_book_player.exe` の1つだけを登録**します。
+* 設定画面の主な項目：
+  * `BookFile`: `winrate_book.db` のパス
+  * `BookMinimaxDepth`: 定跡minimax探索の最大深さ（既定 `24`）
+  * `ChildEnginePath`: 定跡外で指し継ぐエンジン `.exe`（既定 `shogi_engine.exe`、水匠5のフルパスや同フォルダ自動検出にも対応）
+  * `ChildOwnBook`: 定跡外に出た後で子エンジン自身の内蔵定跡を使うか（既定 `false`）
+  * `Threads` / `USI_Hash` / `nodelimit`: 子エンジンへ自動転送されます（水匠5使用時は `nodelimit` が自動的に `NodesLimit` へマッピングされ、`FV_SCALE=0` により水匠5固有の評価値スケールがそのまま維持されます）。
 
 ## License
 
-MIT License（[つようら王11mini/micro の `nn.bin`・`progress.bin` も MIT License](https://yaneurao.fanbox.cc/posts/12761272) で公開されています）
+MIT License

@@ -35,23 +35,33 @@ else()
     endif()
 endif()
 
-# ---- Engine library (shared between engine and tests) ----
+# ---- Engine library (shared between engine, book tools, and tests) ----
 add_library(shogi_core STATIC
     src/board.cpp
     src/movegen.cpp
     src/eval.cpp
     src/search.cpp
+    src/usi_proc.cpp
+    src/winrate_book.cpp
 )
 target_include_directories(shogi_core PUBLIC src)
 target_compile_definitions(shogi_core PRIVATE SHOGIAI_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
-# ---- USI engine executable ----
+# ---- 1. Main USI engine executable ----
 add_executable(shogi_engine src/main.cpp)
 target_link_libraries(shogi_engine PRIVATE shogi_core Threads::Threads)
 
+# ---- 2. Win-Rate Opening Book Generator (200-ply Beam Search + 100 Self-Play Rollouts) ----
+add_executable(winrate_book_gen src/book_gen_main.cpp)
+target_link_libraries(winrate_book_gen PRIVATE shogi_core Threads::Threads)
+
+# ---- 3. Win-Rate Opening Book USI Player / Proxy Engine (for ShogiGUI) ----
+add_executable(winrate_book_player src/book_player_main.cpp)
+target_link_libraries(winrate_book_player PRIVATE shogi_core Threads::Threads)
+
 # ---- Tests ----
 add_executable(shogi_tests tests/test_main.cpp)
-target_link_libraries(shogi_tests PRIVATE shogi_core)
+target_link_libraries(shogi_tests PRIVATE shogi_core Threads::Threads)
 target_include_directories(shogi_tests PRIVATE src)
 
 enable_testing()
