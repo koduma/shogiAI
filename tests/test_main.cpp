@@ -11,12 +11,21 @@
 #include "../src/movegen.hpp"
 #include "../src/eval.hpp"
 #include "../src/search.hpp"
+#include "../src/winrate_book.hpp"
+#include "../src/usi_proc.hpp"
+#include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <string>
 #include <cstring>
 #include <chrono>
 #include <vector>
-#include <filesystem>
+#if defined(_WIN32)
+#include <direct.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #include <sstream>
 
 // ============================================================
@@ -1019,14 +1028,23 @@ static void test_eval_nnue_corrupt_and_invalid_progress_rejected() {
 // Test 3: Auto-discovery is CWD-independent and handles checked-in files.
 // ============================================================
 static void test_eval_auto_discovery_and_cwd_independence() {
-    namespace fs = std::filesystem;
-    const fs::path saved_cwd = fs::current_path();
-
-    fs::current_path(fs::temp_directory_path());
+    char saved_cwd[4096]{};
+#if defined(_WIN32)
+    (void)_getcwd(saved_cwd, sizeof(saved_cwd));
+    char tmp_dir[MAX_PATH]{};
+    if (GetTempPathA(MAX_PATH, tmp_dir) > 0) (void)_chdir(tmp_dir);
+#else
+    if (getcwd(saved_cwd, sizeof(saved_cwd)) == nullptr) saved_cwd[0] = '\0';
+    (void)chdir("/tmp");
+#endif
     set_eval_file_path("");
     set_eval_dir("");
     const std::string status = eval_status_message();
-    fs::current_path(saved_cwd);
+#if defined(_WIN32)
+    if (saved_cwd[0] != '\0') (void)_chdir(saved_cwd);
+#else
+    if (saved_cwd[0] != '\0') (void)chdir(saved_cwd);
+#endif
 
     const EvalFamily fam = get_eval_family();
     CHECK(fam == EvalFamily::SFNN_NNUE || fam == EvalFamily::MATERIAL_FALLBACK);
@@ -1233,6 +1251,7 @@ static void test_perft_and_staged_movegen_equivalence() {
     CHECK_EQ(perft(b, 2), 900ULL);
     CHECK_EQ(perft(b, 3), 25470ULL);
     CHECK_EQ(perft(b, 4), 719731ULL);
+    CHECK_EQ(perft(b, 5), 19861490ULL);
 
     const char* sfens[] = {
         "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
@@ -1286,6 +1305,261 @@ static void test_see_and_mate_detection() {
         CHECK(best != MOVE_NONE);
         CHECK(last_info.score_is_mate);
         CHECK(last_info.score_mate > 0 && last_info.score_mate <= 2);
+    }
+}
+
+
+// ============================================================
+// Test: `nodelimit` strict enforcement (single-thread & multi-thread)
+// ============================================================
+static void test_nodelimit_strict_cap_single_and_multi_thread() {
+    // 1. Single-threaded strict caps across tiny, small, and medium node limits
+    set_num_threads(1);
+    for (uint64_t cap : {1ULL, 5ULL, 25ULL, 100ULL, 777ULL, 5000ULL}) {
+        set_nodelimit(cap);
+        CHECK_EQ(get_nodelimit(), cap);
+
+        Board b;
+        b.set_startpos();
+        const Move best = iterative_deepening_timed(b, TimeBudget{0, 0});
+        const SearchStats st = last_search_stats();
+        const uint64_t total_nodes = st.nodes + st.qnodes;
+
+        CHECK(best != MOVE_NONE);
+        CHECK(is_move_legal(b, best, b.in_check()));
+        CHECK(total_nodes >= 1ULL);
+        CHECK(cap == 1ULL ? (total_nodes <= 1ULL) : (total_nodes < cap));
+    }
+
+    // 2. Multi-threaded (4 threads) strict caps: total nodes across ALL threads must NEVER exceed `nodelimit`!
+    set_num_threads(4);
+    CHECK_EQ(get_num_threads(), 4);
+    for (uint64_t cap : {1ULL, 3ULL, 16ULL, 128ULL, 1000ULL, 12345ULL}) {
+        set_nodelimit(cap);
+
+        Board b;
+        b.parse_sfen("lnsgkgsnl/1r5b1/ppppppppp/9/9/2P6/PP1PPPPPP/1B5R1/LNSGKGSNL w - 2");
+        const Move best = iterative_deepening_timed(b, TimeBudget{0, 0});
+        const SearchStats st = last_search_stats();
+        const uint64_t total_nodes = st.nodes + st.qnodes;
+
+        CHECK(best != MOVE_NONE);
+        CHECK(is_move_legal(b, best, b.in_check()));
+        CHECK(total_nodes >= 1ULL);
+        CHECK(cap == 1ULL ? (total_nodes <= 1ULL) : (total_nodes < cap));
+    }
+
+    // 3. `nodelimit = 0` restores normal unlimited-node search
+    set_nodelimit(0);
+    CHECK_EQ(get_nodelimit(), 0ULL);
+    {
+        Board b;
+        b.set_startpos();
+        const Move best = iterative_deepening_timed(b, TimeBudget{80, 80});
+        const SearchStats st = last_search_stats();
+        CHECK(best != MOVE_NONE);
+        CHECK(st.nodes + st.qnodes > 100ULL);
+    }
+    set_num_threads(1);
+}
+
+// ============================================================
+// Test: Lazy SMP multithreaded search correctness & tactical mate finding
+// ============================================================
+static void test_lazy_smp_multithreaded_search() {
+    set_nodelimit(0);
+    set_num_threads(4);
+
+    // Mate-in-3 tactical position solved concurrently by 4 Lazy SMP threads
+    {
+        Board b;
+        b.parse_sfen("8k/9/7S1/9/9/9/9/9/4K4 b 2G 1");
+        SearchInfo last_info;
+        const Move best = iterative_deepening(b, 500, [&](const SearchInfo& info) {
+            last_info = info;
+        });
+        const SearchStats st = last_search_stats();
+        CHECK(best != MOVE_NONE);
+        CHECK(is_move_legal(b, best, b.in_check()));
+        CHECK(last_info.score_is_mate);
+        CHECK(last_info.score_mate > 0 && last_info.score_mate <= 2);
+        CHECK(st.nodes + st.qnodes > 0);
+        CHECK(st.tt_probes > 0);
+    }
+
+    // Complex midgame position with 4 threads + concurrent NNUE / EvalHash / lock-free TT stress
+    {
+        Board b;
+        b.parse_sfen("ln1g1gsnl/1r3k1b1/p1pppp1pp/1s4p2/9/2P1P4/PP1P1PPPP/1BG4R1/LNS1KGSNL b - 1");
+        std::vector<SearchInfo> infos;
+        const Move best = iterative_deepening_timed(b, TimeBudget{150, 200}, [&](const SearchInfo& info) {
+            infos.push_back(info);
+        }, {}, 8);
+        CHECK(best != MOVE_NONE);
+        CHECK(is_move_legal(b, best, b.in_check()));
+        CHECK(!infos.empty());
+        CHECK(infos.back().nodes >= infos.front().nodes);
+    }
+
+    set_num_threads(1);
+    set_nodelimit(0);
+}
+
+
+// ============================================================
+// Test: WinrateBook DB load/save & Minimax search (Black max, White min, leaf handoff)
+// ============================================================
+static void test_winrate_book_db_and_minimax() {
+    Board root;
+    root.set_startpos();
+    const uint64_t h_root = root.hash();
+
+    const Move m_7g7f = usi_to_move("7g7f");
+    const Move m_2g2f = usi_to_move("2g2f");
+    const Move m_3c3d = usi_to_move("3c3d");
+    const Move m_8c8d = usi_to_move("8c8d");
+
+    // Branch A: 7g7f -> White can choose 3c3d (Black wr 0.58) or 8c8d (Black wr 0.52)
+    //   White minimizes Black wr -> White picks 8c8d (0.52) -> backed-up value of 7g7f is 0.52!
+    root.do_move(m_7g7f);
+    const uint64_t h_7g7f = root.hash();
+    root.do_move(m_3c3d);
+    const uint64_t h_7g7f_3c3d = root.hash();
+    root.undo_move(m_3c3d);
+    root.do_move(m_8c8d);
+    const uint64_t h_7g7f_8c8d = root.hash();
+    root.undo_move(m_8c8d);
+    root.undo_move(m_7g7f);
+
+    // Branch B: 2g2f -> White can choose 3c3d (Black wr 0.61) or 8c8d (Black wr 1.00, +600 pruned leaf!)
+    //   White minimizes Black wr -> White picks 3c3d (0.61) -> backed-up value of 2g2f is 0.61!
+    //   At root, Black maximizes Black wr: max(0.52 [7g7f], 0.61 [2g2f]) = 0.61 -> Black picks 2g2f!
+    root.do_move(m_2g2f);
+    const uint64_t h_2g2f = root.hash();
+    root.do_move(m_3c3d);
+    const uint64_t h_2g2f_3c3d = root.hash();
+    root.undo_move(m_3c3d);
+    root.do_move(m_8c8d);
+    const uint64_t h_2g2f_8c8d = root.hash();
+    root.undo_move(m_8c8d);
+    root.undo_move(m_2g2f);
+
+    WinrateBook book;
+    book.put(h_root,      0.54);
+    book.put(h_7g7f,      0.55);
+    book.put(h_7g7f_3c3d, 0.58);
+    book.put(h_7g7f_8c8d, 0.52);
+    book.put(h_2g2f,      0.56);
+    book.put(h_2g2f_3c3d, 0.61);
+    book.put(h_2g2f_8c8d, 1.00);
+
+    const std::string tmp_db = "test_tmp_winrate_book.db";
+    std::string err;
+    CHECK(book.save_atomic(tmp_db, &err));
+
+    WinrateBook loaded;
+    CHECK(loaded.load(tmp_db, &err));
+    CHECK_EQ(loaded.size(), 7u);
+    std::remove(tmp_db.c_str());
+
+    // 1. Root (Black to move): minimax picks 2g2f with backed-up Black winrate 0.61 (PV: 2g2f 3c3d)
+    {
+        Board b;
+        b.set_startpos();
+        const BookMinimaxResult r = loaded.search_minimax(b, 16);
+        CHECK(r.in_book);
+        CHECK_EQ(r.best_move, m_2g2f);
+        CHECK(std::abs(r.black_winrate - 0.61) < 1e-6);
+        CHECK(std::abs(r.stm_winrate - 0.61) < 1e-6);
+        CHECK_EQ(r.pv.size(), 2u);
+        if (r.pv.size() == 2u) {
+            CHECK_EQ(r.pv[0], m_2g2f);
+            CHECK_EQ(r.pv[1], m_3c3d);
+        }
+    }
+
+    // 2. After 7g7f (White to move): minimax minimizes Black winrate -> picks 8c8d (Black wr 0.52, White wr 0.48)
+    {
+        Board b;
+        b.set_startpos();
+        b.do_move(m_7g7f);
+        const BookMinimaxResult r = loaded.search_minimax(b, 16);
+        CHECK(r.in_book);
+        CHECK_EQ(r.best_move, m_8c8d);
+        CHECK(std::abs(r.black_winrate - 0.52) < 1e-6);
+        CHECK(std::abs(r.stm_winrate - 0.48) < 1e-6);
+    }
+
+    // 3. Leaf book node (`2g2f 8c8d`, pruned at +600 -> 1.0, 0 children in DB):
+    //    `hash_present` is true, `in_book` is false so player hands off cleanly to `shogi_engine`!
+    {
+        Board b;
+        b.set_startpos();
+        b.do_move(m_2g2f);
+        b.do_move(m_8c8d);
+        const BookMinimaxResult r = loaded.search_minimax(b, 16);
+        CHECK(r.hash_present);
+        CHECK(!r.in_book);
+        CHECK(std::abs(r.node_black_wr - 1.0) < 1e-6);
+    }
+
+    // 4. Out-of-book position (`1g1f`): `hash_present == false` and `in_book == false`
+    {
+        Board b;
+        b.set_startpos();
+        b.do_move(usi_to_move("1g1f"));
+        const BookMinimaxResult r = loaded.search_minimax(b, 16);
+        CHECK(!r.hash_present);
+        CHECK(!r.in_book);
+    }
+}
+
+
+static void test_beam_selection_unregistered_first_and_turn_sort() {
+    struct Cand {
+        bool     unreg;
+        int      black_eval;
+        uint64_t hash;
+    };
+
+    // 1. Black's turn (`BLACK`): unregistered strictly first, then DESCENDING `black_eval`!
+    {
+        std::vector<Cand> v = {
+            {false, +500, 10}, // already registered in DB despite huge +500 eval -> must come AFTER unregistered!
+            {true,   -40, 20}, // unregistered (-40)
+            {true,  +120, 30}, // unregistered (+120) -> must be #1!
+            {false, +200, 40}, // registered (+200) -> #4
+            {true,   +35, 50}, // unregistered (+35) -> #2!
+        };
+        std::sort(v.begin(), v.end(), [](const Cand& a, const Cand& b) {
+            return beam_candidate_better(BLACK, a.unreg, a.black_eval, a.hash,
+                                                b.unreg, b.black_eval, b.hash);
+        });
+        CHECK(v[0].unreg && v[0].black_eval == +120);
+        CHECK(v[1].unreg && v[1].black_eval ==  +35);
+        CHECK(v[2].unreg && v[2].black_eval ==  -40);
+        CHECK(!v[3].unreg && v[3].black_eval == +500);
+        CHECK(!v[4].unreg && v[4].black_eval == +200);
+    }
+
+    // 2. White's turn (`WHITE`): unregistered strictly first, then ASCENDING `black_eval`!
+    {
+        std::vector<Cand> v = {
+            {false, -500, 10}, // already registered in DB despite -500 eval -> must come AFTER unregistered!
+            {true,   +60, 20}, // unregistered (+60) -> #3
+            {true,  -150, 30}, // unregistered (-150) -> must be #1!
+            {false, -100, 40}, // registered (-100) -> #5
+            {true,   -20, 50}, // unregistered (-20) -> #2!
+        };
+        std::sort(v.begin(), v.end(), [](const Cand& a, const Cand& b) {
+            return beam_candidate_better(WHITE, a.unreg, a.black_eval, a.hash,
+                                                b.unreg, b.black_eval, b.hash);
+        });
+        CHECK(v[0].unreg && v[0].black_eval == -150);
+        CHECK(v[1].unreg && v[1].black_eval ==  -20);
+        CHECK(v[2].unreg && v[2].black_eval ==  +60);
+        CHECK(!v[3].unreg && v[3].black_eval == -500);
+        CHECK(!v[4].unreg && v[4].black_eval == -100);
     }
 }
 
@@ -1366,10 +1640,15 @@ int main() {
     set_eval_file_path("");
     set_eval_dir("");
     test_real_nnue_if_present();
+    test_nodelimit_strict_cap_single_and_multi_thread();
+    test_lazy_smp_multithreaded_search();
+    test_winrate_book_db_and_minimax();
+    test_beam_selection_unregistered_first_and_turn_sort();
 
     std::cout << "\n=== Test results: "
               << g_pass << " passed, "
               << g_fail << " failed ===\n";
 
+    search_shutdown_threads();
     return g_fail ? 1 : 0;
 }
