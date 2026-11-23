@@ -10,7 +10,9 @@
 #include "eval.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -334,13 +336,14 @@ inline int yo_folded_board_feature(Color view, Piece p, Square s) {
 struct SfnnLayerStack {
     alignas(16) int32_t fc0_b[8];
     AlignedBuffer<int8_t> fc0_w;            // [8 * half_dims], row-major [out][in]
+    AlignedBuffer<int8_t> fc0_w_blocked;    // [(half_dims/32) * 8 * 32], 32B-chunk interleaved (zero 4KB L1D aliasing!)
     alignas(16) int32_t fc1_b[64];
     alignas(16) int8_t  fc1_w_packed[64 * 16]; // active 16 cols per output row
     alignas(16) int8_t  fc1_w_raw32[64 * 32];  // full 32 cols from file (for reference check)
     int32_t             fc2_b;
     alignas(16) int8_t  fc2_w[64];
 
-    SfnnLayerStack() noexcept : fc0_w(), fc2_b(0) {
+    SfnnLayerStack() noexcept : fc0_w(), fc0_w_blocked(), fc2_b(0) {
         std::memset(fc0_b, 0, sizeof(fc0_b));
         std::memset(fc1_b, 0, sizeof(fc1_b));
         std::memset(fc1_w_packed, 0, sizeof(fc1_w_packed));
@@ -349,7 +352,8 @@ struct SfnnLayerStack {
     }
     SfnnLayerStack(const SfnnLayerStack&) = delete;
     SfnnLayerStack& operator=(const SfnnLayerStack&) = delete;
-    SfnnLayerStack(SfnnLayerStack&& o) noexcept : fc0_w(std::move(o.fc0_w)), fc2_b(o.fc2_b) {
+    SfnnLayerStack(SfnnLayerStack&& o) noexcept
+        : fc0_w(std::move(o.fc0_w)), fc0_w_blocked(std::move(o.fc0_w_blocked)), fc2_b(o.fc2_b) {
         std::memcpy(fc0_b, o.fc0_b, sizeof(fc0_b));
         std::memcpy(fc1_b, o.fc1_b, sizeof(fc1_b));
         std::memcpy(fc1_w_packed, o.fc1_w_packed, sizeof(fc1_w_packed));
@@ -359,7 +363,8 @@ struct SfnnLayerStack {
     SfnnLayerStack& operator=(SfnnLayerStack&& o) noexcept {
         if (this != &o) {
             std::memcpy(fc0_b, o.fc0_b, sizeof(fc0_b));
-            fc0_w = std::move(o.fc0_w);
+            fc0_w         = std::move(o.fc0_w);
+            fc0_w_blocked = std::move(o.fc0_w_blocked);
             std::memcpy(fc1_b, o.fc1_b, sizeof(fc1_b));
             std::memcpy(fc1_w_packed, o.fc1_w_packed, sizeof(fc1_w_packed));
             std::memcpy(fc1_w_raw32, o.fc1_w_raw32, sizeof(fc1_w_raw32));
@@ -392,18 +397,21 @@ struct SfnnModel {
 };
 
 // -----------------------------------------------------------------------
-// Evaluation Hash + Incremental Accumulator State Cache
+// Thread-Isolated Evaluation Hash + Incremental Accumulator State Cache
 // -----------------------------------------------------------------------
-constexpr size_t EHASH_SIZE = 1u << 18; // 262,144 entries
-constexpr size_t EHASH_MASK = EHASH_SIZE - 1;
+constexpr size_t EHASH_SIZE_MAIN   = 1u << 18; // 262,144 entries (4 MiB on thread 0)
+constexpr size_t EHASH_SIZE_HELPER = 1u << 16; //  65,536 entries (1 MiB per helper thread)
 struct EvalHashEntry {
-    uint64_t key         = 0;
-    int32_t  score_stm   = 0;
-    uint32_t epoch       = 0;
+    uint64_t key       = 0;
+    int32_t  score_stm = 0;
+    uint32_t epoch     = 0;
 };
 
-constexpr size_t NNUE_CACHE_SIZE = 1u << 10; // 1,024 entries (~16 MiB at L1=4096; covers full search tree spine + branches)
-constexpr size_t NNUE_CACHE_MASK = NNUE_CACHE_SIZE - 1;
+// Ply-indexed DFS accumulator stack (`512` entries on main thread, `256` on helpers):
+// Indexed by `board.history_.size() & state_mask`, guaranteeing that deeper search subtrees
+// NEVER evict ancestor accumulators on the active search path (0% collision full-refresh rate!).
+constexpr size_t NNUE_STACK_SIZE_MAIN   = 1u << 9;  // 512 plies (~8.2 MiB on thread 0)
+constexpr size_t NNUE_STACK_SIZE_HELPER = 1u << 8;  // 256 plies (~4.1 MiB per helper thread)
 struct NnueStateEntry {
     int16_t  acc[COLOR_NB][kMaxSupportedL1];
     uint64_t pos_key;     // Zobrist key ignoring side-to-move (`board.hash() ^ (stm==WHITE ? Zobrist::side : 0)`)
@@ -416,45 +424,98 @@ struct NnueStateEntry {
 };
 static_assert((sizeof(NnueStateEntry) % 64) == 0, "NnueStateEntry size must be a multiple of 64 bytes");
 
-// Global state
-bool        g_loaded_once         = false;
-bool        g_explicit_eval_file  = false;
-bool        g_explicit_prog_file  = false;
-bool        g_explicit_eval_dir   = false;
-int         g_fv_scale            = 24;
-uint32_t    g_cache_epoch         = 1;
-uint32_t    g_config_epoch        = 1;
-std::string g_eval_dir            = "eval";
-std::string g_eval_file_path;
-std::string g_prog_file_path;
-std::string g_status              = "material-only fallback (nn.bin not loaded)";
-EvalFamily  g_family              = EvalFamily::MATERIAL_FALLBACK;
-SfnnModel   g_model;
+struct alignas(16) EvalWorkerContext {
+    std::vector<EvalHashEntry>    ehash;
+    size_t                        ehash_mask = 0;
+    AlignedBuffer<NnueStateEntry> state_cache; // ply-indexed accumulator stack
+    size_t                        state_mask = 0;
+    AlignedBuffer<uint8_t>        tf_buf;
+    uint16_t                      nz_offsets[kMaxSupportedL1 / 32]{};
+    uint32_t                      synced_epoch = 0;
+    int                           synced_fv_scale = 24;
+    uint8_t                       cacheline_pad[64]{};
 
-std::vector<EvalHashEntry>        g_ehash(EHASH_SIZE);
-AlignedBuffer<NnueStateEntry>     g_state_cache;
-AlignedBuffer<NnueStateEntry>     g_tmp_state;
-AlignedBuffer<uint8_t>            g_tf_buf;
+    explicit EvalWorkerContext(int tid) {
+        const size_t eh_sz = (tid == 0) ? EHASH_SIZE_MAIN : EHASH_SIZE_HELPER;
+        ehash.assign(eh_sz, EvalHashEntry{});
+        ehash_mask = eh_sz - 1;
+    }
 
-void ensure_state_cache_allocated() {
-    if (!g_state_cache.ptr) {
-        g_state_cache.allocate(NNUE_CACHE_SIZE);
+    void ensure_nnue_buffers(int tid) {
+        if (!state_cache.ptr) {
+            const size_t sc_sz = (tid == 0) ? NNUE_STACK_SIZE_MAIN : NNUE_STACK_SIZE_HELPER;
+            state_cache.allocate(sc_sz);
+            state_mask = sc_sz - 1;
+        }
+        if (!tf_buf.ptr) {
+            tf_buf.allocate(kMaxSupportedL1);
+        }
     }
-    if (!g_tmp_state.ptr) {
-        g_tmp_state.allocate(2);
+};
+
+// Global state (model weights are immutable during search; config guarded by g_eval_mutex)
+std::mutex            g_eval_mutex;
+std::atomic<bool>     g_loaded_once{false};
+bool                  g_explicit_eval_file = false;
+bool                  g_explicit_prog_file = false;
+bool                  g_explicit_eval_dir  = false;
+std::atomic<int>      g_fv_scale{24};
+std::atomic<uint32_t> g_cache_epoch{1};
+std::atomic<uint32_t> g_config_epoch{1};
+std::string           g_eval_dir = "eval";
+std::string           g_eval_file_path;
+std::string           g_prog_file_path;
+std::string           g_status   = "material-only fallback (nn.bin not loaded)";
+EvalFamily            g_family   = EvalFamily::MATERIAL_FALLBACK;
+SfnnModel             g_model;
+
+std::array<std::unique_ptr<EvalWorkerContext>, MAX_EVAL_THREADS> g_eval_workers{};
+std::array<std::atomic<EvalWorkerContext*>, MAX_EVAL_THREADS>    g_eval_worker_ptrs{};
+EvalWorkerContext*                                               g_fast_workers[MAX_EVAL_THREADS]{};
+std::atomic<bool>                                                g_fast_ready{false};
+int                                                              g_fast_thread_cnt = 0;
+
+EvalWorkerContext& get_or_create_eval_worker(int thread_id, bool need_nnue_buffers) {
+    const int tid = std::clamp(thread_id, 0, MAX_EVAL_THREADS - 1);
+    EvalWorkerContext* ctx = g_eval_worker_ptrs[static_cast<size_t>(tid)].load(std::memory_order_acquire);
+    if (!ctx) {
+        std::lock_guard<std::mutex> lock(g_eval_mutex);
+        ctx = g_eval_worker_ptrs[static_cast<size_t>(tid)].load(std::memory_order_relaxed);
+        if (!ctx) {
+            g_eval_workers[static_cast<size_t>(tid)] = std::make_unique<EvalWorkerContext>(tid);
+            ctx = g_eval_workers[static_cast<size_t>(tid)].get();
+            if (need_nnue_buffers) ctx->ensure_nnue_buffers(tid);
+            g_eval_worker_ptrs[static_cast<size_t>(tid)].store(ctx, std::memory_order_release);
+        }
     }
-    if (!g_tf_buf.ptr) {
-        g_tf_buf.allocate(kMaxSupportedL1);
+    if (need_nnue_buffers && !ctx->state_cache.ptr) {
+        ctx->ensure_nnue_buffers(tid);
     }
+
+    const uint32_t cur_ep = g_cache_epoch.load(std::memory_order_relaxed);
+    const int      cur_sc = g_fv_scale.load(std::memory_order_relaxed);
+    if (ctx->synced_epoch != cur_ep) {
+        if (cur_ep < ctx->synced_epoch) {
+            // Wrap-around protection: wipe stale epochs
+            std::fill(ctx->ehash.begin(), ctx->ehash.end(), EvalHashEntry{});
+            if (ctx->state_cache.ptr) {
+                for (size_t i = 0; i <= ctx->state_mask; ++i) ctx->state_cache[i].epoch = 0;
+            }
+        }
+        ctx->synced_epoch = cur_ep;
+    }
+    if (ctx->synced_fv_scale != cur_sc) {
+        std::fill(ctx->ehash.begin(), ctx->ehash.end(), EvalHashEntry{});
+        ctx->synced_fv_scale = cur_sc;
+    }
+    return *ctx;
 }
 
 void bump_cache_epoch() {
-    if (++g_cache_epoch == 0) {
-        std::fill(g_ehash.begin(), g_ehash.end(), EvalHashEntry{});
-        if (g_state_cache.ptr) {
-            for (size_t i = 0; i < NNUE_CACHE_SIZE; ++i) g_state_cache[i].epoch = 0;
-        }
-        g_cache_epoch = 1;
+    g_fast_ready.store(false, std::memory_order_relaxed);
+    uint32_t next = g_cache_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (next == 0) {
+        g_cache_epoch.store(1, std::memory_order_relaxed);
     }
 }
 
@@ -743,6 +804,16 @@ bool load_sfnn_model_from_files(const std::string& nn_path, const std::string& p
             out_status = "material-only fallback (fc0 weights truncated: " + nn_path + ")";
             return false;
         }
+        st.fc0_w_blocked.allocate(static_cast<size_t>(8 * half_dims));
+        if ((half_dims % 32) == 0) {
+            const int n_blks = half_dims / 32;
+            for (int blk = 0; blk < n_blks; ++blk) {
+                for (int o = 0; o < 8; ++o) {
+                    std::memcpy(st.fc0_w_blocked.ptr + (blk * 8 + o) * 32,
+                                st.fc0_w.ptr + o * half_dims + blk * 32, 32);
+                }
+            }
+        }
         for (int o = 0; o < 64; ++o) {
             uint32_t u = 0;
             if (!read_le<uint32_t>(nf, u)) return false;
@@ -793,7 +864,7 @@ bool load_sfnn_model_from_files(const std::string& nn_path, const std::string& p
     std::ostringstream oss;
     oss << "SFNN NNUE loaded from " << nn_path << " [" << source_tag
         << "] [arch=" << arch << "] [" << prog_note
-        << "] [FV_SCALE=" << g_fv_scale << "] [family=SFNN_NNUE]";
+        << "] [FV_SCALE=" << g_fv_scale.load(std::memory_order_relaxed) << "] [family=SFNN_NNUE]";
     out_status = oss.str();
     return true;
 }
@@ -815,37 +886,78 @@ std::vector<std::string> build_discovery_dirs() {
     return dirs;
 }
 
-void ensure_loaded() {
-    if (g_loaded_once) return;
-    g_loaded_once = true;
-    g_family      = EvalFamily::MATERIAL_FALLBACK;
-    g_model       = SfnnModel{};
+void ensure_loaded_locked() {
+    if (g_loaded_once.load(std::memory_order_relaxed)) return;
+    g_family = EvalFamily::MATERIAL_FALLBACK;
+    g_model  = SfnnModel{};
     bump_cache_epoch();
+
+    auto is_default_usi_eval_file = [](const std::string& p) {
+        return p == "eval/nn.bin" || p == "eval\\nn.bin" || p == "./eval/nn.bin" || p == ".\\eval\\nn.bin";
+    };
+    auto is_default_usi_prog_file = [](const std::string& p) {
+        return p == "eval/progress.bin" || p == "eval\\progress.bin" || p == "./eval/progress.bin" || p == ".\\eval\\progress.bin";
+    };
+    auto is_default_usi_eval_dir = [](const std::string& d) {
+        return d == "eval" || d == "./eval" || d == ".\\eval" || d == "eval/" || d == "eval\\";
+    };
 
     // Priority 1: Explicit `set_eval_file_path` (USI `EvalFile`)
     if (g_explicit_eval_file && !g_eval_file_path.empty()) {
         const std::string nn_p = g_eval_file_path;
-        const std::string pr_p = (g_explicit_prog_file && !g_prog_file_path.empty())
-                               ? g_prog_file_path
-                               : path_join(path_parent_dir(nn_p), "progress.bin");
+        const bool use_custom_pr = (g_explicit_prog_file && !g_prog_file_path.empty() && !is_default_usi_prog_file(g_prog_file_path));
+        const std::string pr_p = use_custom_pr ? g_prog_file_path : path_join(path_parent_dir(nn_p), "progress.bin");
         if (load_sfnn_model_from_files(nn_p, pr_p, "explicit", g_model, g_status)) {
             g_family = EvalFamily::SFNN_NNUE;
-            ensure_state_cache_allocated();
+            return;
         }
-        return;
+        // Also try resolving relative path against executable directory (ShogiGUI CWD independence!)
+        const std::string exe_dir = get_executable_dir();
+        if (!exe_dir.empty()) {
+            const std::string exe_nn = path_join(exe_dir, nn_p);
+            const std::string exe_pr = use_custom_pr ? path_join(exe_dir, g_prog_file_path)
+                                                     : path_join(path_parent_dir(exe_nn), "progress.bin");
+            std::string tmp_st;
+            if (load_sfnn_model_from_files(exe_nn, exe_pr, "explicit(exe_dir)", g_model, tmp_st)) {
+                g_status = tmp_st;
+                g_family = EvalFamily::SFNN_NNUE;
+                return;
+            }
+        }
+        // CRITICAL FIX: When ShogiGUI saves Engine Settings (e.g. changing `Threads` or `nodelimit`),
+        // ShogiGUI sends all default option values including `setoption name EvalFile value eval/nn.bin`!
+        // If `nn_p` was merely the default `"eval/nn.bin"`, fall through to full auto-discovery (`src/eval/nn.bin`, etc.)
+        // instead of dropping into `MATERIAL_FALLBACK` (Elo 2000)!
+        if (!is_default_usi_eval_file(nn_p)) {
+            return;
+        }
     }
 
     // Priority 2: Explicit `set_eval_dir` (USI `EvalDir`)
     if (g_explicit_eval_dir && !g_eval_dir.empty()) {
         const std::string nn_p = path_join(g_eval_dir, "nn.bin");
-        const std::string pr_p = (g_explicit_prog_file && !g_prog_file_path.empty())
-                               ? g_prog_file_path
-                               : path_join(g_eval_dir, "progress.bin");
+        const bool use_custom_pr = (g_explicit_prog_file && !g_prog_file_path.empty() && !is_default_usi_prog_file(g_prog_file_path));
+        const std::string pr_p = use_custom_pr ? g_prog_file_path : path_join(g_eval_dir, "progress.bin");
         if (load_sfnn_model_from_files(nn_p, pr_p, "eval_dir", g_model, g_status)) {
             g_family = EvalFamily::SFNN_NNUE;
-            ensure_state_cache_allocated();
+            return;
         }
-        return;
+        const std::string exe_dir = get_executable_dir();
+        if (!exe_dir.empty()) {
+            const std::string exe_ed = path_join(exe_dir, g_eval_dir);
+            const std::string exe_nn = path_join(exe_ed, "nn.bin");
+            const std::string exe_pr = use_custom_pr ? path_join(exe_dir, g_prog_file_path)
+                                                     : path_join(exe_ed, "progress.bin");
+            std::string tmp_st;
+            if (load_sfnn_model_from_files(exe_nn, exe_pr, "eval_dir(exe_dir)", g_model, tmp_st)) {
+                g_status = tmp_st;
+                g_family = EvalFamily::SFNN_NNUE;
+                return;
+            }
+        }
+        if (!is_default_usi_eval_dir(g_eval_dir)) {
+            return;
+        }
     }
 
     // Priority 3: Environment variables `SHOGIAI_EVAL_FILE` / `SHOGIAI_EVAL_DIR`
@@ -858,8 +970,7 @@ void ensure_loaded() {
                                    : path_join(path_parent_dir(nn_p), "progress.bin");
             if (load_sfnn_model_from_files(nn_p, pr_p, "env:SHOGIAI_EVAL_FILE", g_model, g_status)) {
                 g_family = EvalFamily::SFNN_NNUE;
-                ensure_state_cache_allocated();
-            }
+                }
             return;
         }
     }
@@ -870,8 +981,7 @@ void ensure_loaded() {
             const std::string pr_p = path_join(dir, "progress.bin");
             if (load_sfnn_model_from_files(nn_p, pr_p, "env:SHOGIAI_EVAL_DIR", g_model, g_status)) {
                 g_family = EvalFamily::SFNN_NNUE;
-                ensure_state_cache_allocated();
-            }
+                }
             return;
         }
     }
@@ -889,14 +999,14 @@ void ensure_loaded() {
         probe.close();
 
         const std::string abs_nn = make_absolute_path(nn_cand);
-        const std::string pr_cand = (g_explicit_prog_file && !g_prog_file_path.empty())
+        const bool use_custom_pr4 = (g_explicit_prog_file && !g_prog_file_path.empty() && !is_default_usi_prog_file(g_prog_file_path));
+        const std::string pr_cand = use_custom_pr4
                                   ? g_prog_file_path
                                   : path_join(path_parent_dir(abs_nn), "progress.bin");
         std::string st;
         if (load_sfnn_model_from_files(abs_nn, pr_cand, "auto", g_model, st)) {
             g_status = st;
             g_family = EvalFamily::SFNN_NNUE;
-            ensure_state_cache_allocated();
             return;
         }
         if (first_non_missing_status.empty()) {
@@ -918,6 +1028,22 @@ void ensure_loaded() {
     g_status = oss.str();
 }
 
+void ensure_loaded() {
+    if (g_loaded_once.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_eval_mutex);
+    if (!g_loaded_once.load(std::memory_order_relaxed)) {
+        ensure_loaded_locked();
+        if (g_family == EvalFamily::SFNN_NNUE) {
+            if (!g_eval_workers[0]) {
+                g_eval_workers[0] = std::make_unique<EvalWorkerContext>(0);
+            }
+            g_eval_workers[0]->ensure_nnue_buffers(0);
+            g_eval_worker_ptrs[0].store(g_eval_workers[0].get(), std::memory_order_release);
+        }
+        g_loaded_once.store(true, std::memory_order_release);
+    }
+}
+
 // -----------------------------------------------------------------------
 // Material & Heuristic Progress Fallbacks
 // -----------------------------------------------------------------------
@@ -933,11 +1059,9 @@ double heuristic_progress(const Board& board) {
         for (int pt = PAWN; pt <= ROOK; ++pt)
             hand_total += board.hand(static_cast<Color>(c), static_cast<PieceType>(pt));
 
-    int promoted_cnt = 0;
-    for (int s = 0; s < SQUARE_NB; ++s) {
-        const Piece p = board.piece_at(s);
-        if (p != NO_PIECE && is_promoted(type_of(p))) ++promoted_cnt;
-    }
+    const int promoted_cnt = (board.pieces(PROM_PAWN)   | board.pieces(PROM_LANCE)  |
+                              board.pieces(PROM_KNIGHT) | board.pieces(PROM_SILVER) |
+                              board.pieces(PROM_BISHOP) | board.pieces(PROM_ROOK)).count();
 
     const double p_ply  = std::clamp(static_cast<double>(board.ply_) / 120.0, 0.0, 1.0);
     const double p_feat = std::clamp((hand_total * 1.5 + promoted_cnt * 3.0) / 36.0, 0.0, 1.0);
@@ -986,32 +1110,41 @@ inline void simd_add_inplace_i16(int16_t* acc, const int16_t* w, int dims) {
     for (; j < dims; ++j) acc[j] = static_cast<int16_t>(acc[j] + w[j]);
 }
 
-inline void simd_sub1_add1_i16(int16_t* dst, const int16_t* src,
-                               const int16_t* rem0, const int16_t* add0, int dims) {
+inline void simd_sub1_add1_i16(int16_t* __restrict dst, const int16_t* __restrict src,
+                               const int16_t* __restrict rem0, const int16_t* __restrict add0, int dims) {
     int j = 0;
 #if defined(__AVX512BW__) && !defined(SHOGIAI_NO_AVX512)
     for (; j + 64 <= dims; j += 64) {
         __m512i s0 = _mm512_loadu_si512(src + j);
-        __m512i r0 = _mm512_loadu_si512(rem0 + j);
-        __m512i a0 = _mm512_loadu_si512(add0 + j);
-        _mm512_storeu_si512(dst + j, _mm512_add_epi16(_mm512_sub_epi16(s0, r0), a0));
-
         __m512i s1 = _mm512_loadu_si512(src + j + 32);
-        __m512i r1 = _mm512_loadu_si512(rem0 + j + 32);
-        __m512i a1 = _mm512_loadu_si512(add0 + j + 32);
-        _mm512_storeu_si512(dst + j + 32, _mm512_add_epi16(_mm512_sub_epi16(s1, r1), a1));
+        s0 = _mm512_sub_epi16(s0, _mm512_loadu_si512(rem0 + j));
+        s1 = _mm512_sub_epi16(s1, _mm512_loadu_si512(rem0 + j + 32));
+        s0 = _mm512_add_epi16(s0, _mm512_loadu_si512(add0 + j));
+        s1 = _mm512_add_epi16(s1, _mm512_loadu_si512(add0 + j + 32));
+        _mm512_storeu_si512(dst + j, s0);
+        _mm512_storeu_si512(dst + j + 32, s1);
     }
 #elif defined(__AVX2__)
-    for (; j + 32 <= dims; j += 32) {
-        __m256i s0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j));
-        __m256i r0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j));
-        __m256i a0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), _mm256_add_epi16(_mm256_sub_epi16(s0, r0), a0));
+    for (; j + 64 <= dims; j += 64) {
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 16));
+        __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 32));
+        __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 48));
 
-        __m256i s1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 16));
-        __m256i r1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 16));
-        __m256i a1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 16));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 16), _mm256_add_epi16(_mm256_sub_epi16(s1, r1), a1));
+        v0 = _mm256_sub_epi16(v0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j)));
+        v1 = _mm256_sub_epi16(v1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 16)));
+        v2 = _mm256_sub_epi16(v2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 32)));
+        v3 = _mm256_sub_epi16(v3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 48)));
+
+        v0 = _mm256_add_epi16(v0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j)));
+        v1 = _mm256_add_epi16(v1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 16)));
+        v2 = _mm256_add_epi16(v2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 32)));
+        v3 = _mm256_add_epi16(v3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 48)));
+
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), v0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 16), v1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 32), v2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 48), v3);
     }
 #elif defined(__SSE2__)
     for (; j + 8 <= dims; j += 8) {
@@ -1026,27 +1159,56 @@ inline void simd_sub1_add1_i16(int16_t* dst, const int16_t* src,
     }
 }
 
-inline void simd_sub2_add2_i16(int16_t* dst, const int16_t* src,
-                               const int16_t* rem0, const int16_t* rem1,
-                               const int16_t* add0, const int16_t* add1, int dims) {
+inline void simd_sub2_add2_i16(int16_t* __restrict dst, const int16_t* __restrict src,
+                               const int16_t* __restrict rem0, const int16_t* __restrict rem1,
+                               const int16_t* __restrict add0, const int16_t* __restrict add1, int dims) {
     int j = 0;
 #if defined(__AVX512BW__) && !defined(SHOGIAI_NO_AVX512)
-    for (; j + 32 <= dims; j += 32) {
-        __m512i v = _mm512_loadu_si512(src + j);
-        v = _mm512_sub_epi16(v, _mm512_loadu_si512(rem0 + j));
-        v = _mm512_sub_epi16(v, _mm512_loadu_si512(rem1 + j));
-        v = _mm512_add_epi16(v, _mm512_loadu_si512(add0 + j));
-        v = _mm512_add_epi16(v, _mm512_loadu_si512(add1 + j));
-        _mm512_storeu_si512(dst + j, v);
+    for (; j + 64 <= dims; j += 64) {
+        __m512i v0 = _mm512_loadu_si512(src + j);
+        __m512i v1 = _mm512_loadu_si512(src + j + 32);
+        v0 = _mm512_sub_epi16(v0, _mm512_loadu_si512(rem0 + j));
+        v1 = _mm512_sub_epi16(v1, _mm512_loadu_si512(rem0 + j + 32));
+        v0 = _mm512_sub_epi16(v0, _mm512_loadu_si512(rem1 + j));
+        v1 = _mm512_sub_epi16(v1, _mm512_loadu_si512(rem1 + j + 32));
+        v0 = _mm512_add_epi16(v0, _mm512_loadu_si512(add0 + j));
+        v1 = _mm512_add_epi16(v1, _mm512_loadu_si512(add0 + j + 32));
+        v0 = _mm512_add_epi16(v0, _mm512_loadu_si512(add1 + j));
+        v1 = _mm512_add_epi16(v1, _mm512_loadu_si512(add1 + j + 32));
+        _mm512_storeu_si512(dst + j, v0);
+        _mm512_storeu_si512(dst + j + 32, v1);
     }
 #elif defined(__AVX2__)
-    for (; j + 16 <= dims; j += 16) {
-        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j));
-        v = _mm256_sub_epi16(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j)));
-        v = _mm256_sub_epi16(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem1 + j)));
-        v = _mm256_add_epi16(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j)));
-        v = _mm256_add_epi16(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add1 + j)));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), v);
+    for (; j + 64 <= dims; j += 64) {
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 16));
+        __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 32));
+        __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j + 48));
+
+        v0 = _mm256_sub_epi16(v0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j)));
+        v1 = _mm256_sub_epi16(v1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 16)));
+        v2 = _mm256_sub_epi16(v2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 32)));
+        v3 = _mm256_sub_epi16(v3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem0 + j + 48)));
+
+        v0 = _mm256_sub_epi16(v0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem1 + j)));
+        v1 = _mm256_sub_epi16(v1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem1 + j + 16)));
+        v2 = _mm256_sub_epi16(v2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem1 + j + 32)));
+        v3 = _mm256_sub_epi16(v3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(rem1 + j + 48)));
+
+        v0 = _mm256_add_epi16(v0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j)));
+        v1 = _mm256_add_epi16(v1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 16)));
+        v2 = _mm256_add_epi16(v2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 32)));
+        v3 = _mm256_add_epi16(v3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add0 + j + 48)));
+
+        v0 = _mm256_add_epi16(v0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add1 + j)));
+        v1 = _mm256_add_epi16(v1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add1 + j + 16)));
+        v2 = _mm256_add_epi16(v2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add1 + j + 32)));
+        v3 = _mm256_add_epi16(v3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add1 + j + 48)));
+
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), v0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 16), v1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 32), v2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j + 48), v3);
     }
 #elif defined(__SSE2__)
     for (; j + 8 <= dims; j += 8) {
@@ -1063,7 +1225,8 @@ inline void simd_sub2_add2_i16(int16_t* dst, const int16_t* src,
     }
 }
 
-inline void pairwise_transform_perspective(const int16_t* acc, uint8_t* out, int half_dims) {
+inline void pairwise_transform_perspective(const int16_t* acc, uint8_t* out, int half_dims,
+                                           int base_offset, uint16_t* nz_offsets, int& n_nz) {
     const int half_out = half_dims / 2;
     int j = 0;
 #if defined(__AVX2__)
@@ -1080,8 +1243,11 @@ inline void pairwise_transform_perspective(const int16_t* acc, uint8_t* out, int
 
         __m256i packed = _mm256_permute4x64_epi64(_mm256_packus_epi16(p0, p1), 0xD8);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + j), packed);
+        nz_offsets[n_nz] = static_cast<uint16_t>(base_offset + j);
+        n_nz += (_mm256_testz_si256(packed, packed) == 0);
     }
 #elif defined(__SSE2__)
+    (void)base_offset; (void)nz_offsets; (void)n_nz;
     const __m128i zero = _mm_setzero_si128();
     const __m128i k127 = _mm_set1_epi16(127);
     for (; j + 16 <= half_out; j += 16) {
@@ -1095,6 +1261,8 @@ inline void pairwise_transform_perspective(const int16_t* acc, uint8_t* out, int
 
         _mm_storeu_si128(reinterpret_cast<__m128i*>(out + j), _mm_packus_epi16(p0, p1));
     }
+#else
+    (void)base_offset; (void)nz_offsets; (void)n_nz;
 #endif
     for (; j < half_out; ++j) {
         const int s0 = std::clamp<int>(acc[j], 0, 127);
@@ -1112,12 +1280,13 @@ inline int32_t hsum_epi32_avx2(__m256i v) {
 }
 #endif
 
-int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int input_dims) {
+int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int input_dims,
+                             const uint16_t* nz_offsets, int n_nz) {
     int32_t h0[8];
     for (int o = 0; o < 8; ++o) h0[o] = st.fc0_b[o];
 
 #if defined(__AVX2__)
-  {
+  if ((input_dims % 64) == 0) {
     __m256i acc0 = _mm256_setzero_si256();
     __m256i acc1 = _mm256_setzero_si256();
     __m256i acc2 = _mm256_setzero_si256();
@@ -1130,36 +1299,29 @@ int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int in
     const __m256i ones16 = _mm256_set1_epi16(1);
 #endif
 
-    const int8_t* w0 = st.fc0_w.ptr + 0 * input_dims;
-    const int8_t* w1 = st.fc0_w.ptr + 1 * input_dims;
-    const int8_t* w2 = st.fc0_w.ptr + 2 * input_dims;
-    const int8_t* w3 = st.fc0_w.ptr + 3 * input_dims;
-    const int8_t* w4 = st.fc0_w.ptr + 4 * input_dims;
-    const int8_t* w5 = st.fc0_w.ptr + 5 * input_dims;
-    const int8_t* w6 = st.fc0_w.ptr + 6 * input_dims;
-    const int8_t* w7 = st.fc0_w.ptr + 7 * input_dims;
-
-    for (int i = 0; i < input_dims; i += 32) {
-        const __m256i u = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tf + i));
-        if (_mm256_testz_si256(u, u)) continue;
+    const int8_t* const wb_base = st.fc0_w_blocked.ptr;
+    for (int k = 0; k < n_nz; ++k) {
+        const size_t off = nz_offsets[k];
+        const __m256i u  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tf + off));
+        const int8_t* wb = wb_base + off * 8;
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && !defined(SHOGIAI_NO_AVX512)
-        acc0 = _mm256_dpbusd_epi32(acc0, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i)));
-        acc1 = _mm256_dpbusd_epi32(acc1, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i)));
-        acc2 = _mm256_dpbusd_epi32(acc2, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i)));
-        acc3 = _mm256_dpbusd_epi32(acc3, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i)));
-        acc4 = _mm256_dpbusd_epi32(acc4, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w4 + i)));
-        acc5 = _mm256_dpbusd_epi32(acc5, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w5 + i)));
-        acc6 = _mm256_dpbusd_epi32(acc6, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w6 + i)));
-        acc7 = _mm256_dpbusd_epi32(acc7, u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w7 + i)));
+        acc0 = _mm256_dpbusd_epi32(acc0, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +   0)));
+        acc1 = _mm256_dpbusd_epi32(acc1, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +  32)));
+        acc2 = _mm256_dpbusd_epi32(acc2, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +  64)));
+        acc3 = _mm256_dpbusd_epi32(acc3, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +  96)));
+        acc4 = _mm256_dpbusd_epi32(acc4, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 128)));
+        acc5 = _mm256_dpbusd_epi32(acc5, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 160)));
+        acc6 = _mm256_dpbusd_epi32(acc6, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 192)));
+        acc7 = _mm256_dpbusd_epi32(acc7, u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 224)));
 #else
-        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i))), ones16));
-        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i))), ones16));
-        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i))), ones16));
-        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i))), ones16));
-        acc4 = _mm256_add_epi32(acc4, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w4 + i))), ones16));
-        acc5 = _mm256_add_epi32(acc5, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w5 + i))), ones16));
-        acc6 = _mm256_add_epi32(acc6, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w6 + i))), ones16));
-        acc7 = _mm256_add_epi32(acc7, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w7 + i))), ones16));
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +   0))), ones16));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +  32))), ones16));
+        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +  64))), ones16));
+        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb +  96))), ones16));
+        acc4 = _mm256_add_epi32(acc4, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 128))), ones16));
+        acc5 = _mm256_add_epi32(acc5, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 160))), ones16));
+        acc6 = _mm256_add_epi32(acc6, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 192))), ones16));
+        acc7 = _mm256_add_epi32(acc7, _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(wb + 224))), ones16));
 #endif
     }
     h0[0] += hsum_epi32_avx2(acc0);
@@ -1170,8 +1332,16 @@ int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int in
     h0[5] += hsum_epi32_avx2(acc5);
     h0[6] += hsum_epi32_avx2(acc6);
     h0[7] += hsum_epi32_avx2(acc7);
+  } else {
+    for (int o = 0; o < 8; ++o) {
+        const int8_t* w = st.fc0_w.ptr + o * input_dims;
+        int32_t s = 0;
+        for (int i = 0; i < input_dims; ++i) s += static_cast<int32_t>(tf[i]) * w[i];
+        h0[o] += s;
+    }
   }
 #else
+    (void)nz_offsets; (void)n_nz;
     for (int o = 0; o < 8; ++o) {
         const int8_t* w = st.fc0_w.ptr + o * input_dims;
         int32_t s = 0;
@@ -1234,13 +1404,12 @@ int32_t propagate_sfnn_stack(const SfnnLayerStack& st, const uint8_t* tf, int in
 // -----------------------------------------------------------------------
 void build_nonking_lists(const Board& board, int* fb_list, int* fw_list, int& out_n) {
     int n = 0;
-    for (int s = 0; s < SQUARE_NB; ++s) {
+    board.occ_all().and_not(board.pieces(KING)).for_each([&](Square s) {
         const Piece p = board.piece_at(s);
-        if (p == NO_PIECE || type_of(p) == KING) continue;
         fb_list[n] = yo_folded_board_feature(BLACK, p, s);
         fw_list[n] = yo_folded_board_feature(WHITE, p, s);
         ++n;
-    }
+    });
     for (Color c : {BLACK, WHITE}) {
         for (int pt_i = PAWN; pt_i <= ROOK; ++pt_i) {
             const PieceType pt = static_cast<PieceType>(pt_i);
@@ -1293,7 +1462,7 @@ void compute_full_state(const Board& board, NnueStateEntry& dst) {
     }
 
     dst.pos_key    = board_piece_key(board);
-    dst.epoch      = g_cache_epoch;
+    dst.epoch      = g_cache_epoch.load(std::memory_order_relaxed);
     dst.yo_bk      = static_cast<int16_t>(yo_bk);
     dst.yo_wk_inv  = static_cast<int16_t>(yo_wk_inv);
     dst.sum_bk_q16 = sb;
@@ -1302,7 +1471,8 @@ void compute_full_state(const Board& board, NnueStateEntry& dst) {
 
 // Applies a single `StateInfo` step from `src` into `dst`.
 // Returns false only if an overflowing synthetic hand count (> max_hand_count) prevents clean 1-slot diff.
-bool apply_incremental_step(const StateInfo& si, const NnueStateEntry& src, NnueStateEntry& dst, uint64_t next_piece_key) {
+bool apply_incremental_step(const StateInfo& si, const NnueStateEntry& src, NnueStateEntry& dst,
+                            uint64_t next_piece_key, uint32_t cur_epoch) {
     const int half_dims = g_model.half_dims;
     if (si.null_move) {
         if (&dst != &src) {
@@ -1310,7 +1480,7 @@ bool apply_incremental_step(const StateInfo& si, const NnueStateEntry& src, Nnue
             simd_copy_i16(dst.acc[WHITE], src.acc[WHITE], half_dims);
         }
         dst.pos_key    = next_piece_key;
-        dst.epoch      = g_cache_epoch;
+        dst.epoch      = cur_epoch;
         dst.yo_bk      = src.yo_bk;
         dst.yo_wk_inv  = src.yo_wk_inv;
         dst.sum_bk_q16 = src.sum_bk_q16;
@@ -1425,7 +1595,7 @@ bool apply_incremental_step(const StateInfo& si, const NnueStateEntry& src, Nnue
     }
 
     dst.pos_key    = next_piece_key;
-    dst.epoch      = g_cache_epoch;
+    dst.epoch      = cur_epoch;
     dst.yo_bk      = static_cast<int16_t>(next_yo_bk);
     dst.yo_wk_inv  = static_cast<int16_t>(next_yo_wk_inv);
     dst.sum_bk_q16 = sb;
@@ -1433,58 +1603,70 @@ bool apply_incremental_step(const StateInfo& si, const NnueStateEntry& src, Nnue
     return true;
 }
 
-const NnueStateEntry& get_or_update_nnue_state(const Board& board) {
-    ensure_state_cache_allocated();
-    const uint64_t cur_pkey = board_piece_key(board);
-    NnueStateEntry& cur_slot = g_state_cache[cur_pkey & NNUE_CACHE_MASK];
-    if (cur_slot.epoch == g_cache_epoch && cur_slot.pos_key == cur_pkey) {
+const NnueStateEntry& get_or_update_nnue_state(const Board& board, EvalWorkerContext& ws) {
+    const uint32_t cur_epoch = ws.synced_epoch;
+    const size_t   sc_mask   = ws.state_mask;
+    const size_t   hist_sz   = board.history_.size();
+    const uint64_t cur_pkey  = board_piece_key(board);
+    NnueStateEntry& cur_slot = ws.state_cache[hist_sz & sc_mask];
+    auto finalize_progress = [&](NnueStateEntry& slot) {
+        if (g_model.progress_loaded &&
+            (slot.sum_bk_q16 == std::numeric_limits<int64_t>::min() ||
+             slot.sum_wk_q16 == std::numeric_limits<int64_t>::min())) {
+            int fb_list[44], fw_list[44], n = 0;
+            build_nonking_lists(board, fb_list, fw_list, n);
+            if (slot.sum_bk_q16 == std::numeric_limits<int64_t>::min()) {
+                const int32_t* row_b = g_model.progress_q16.data() + static_cast<size_t>(slot.yo_bk) * kBonaFeEnd;
+                int64_t sb = 0;
+                for (int i = 0; i < n; ++i) sb += row_b[fb_list[i]];
+                slot.sum_bk_q16 = sb;
+            }
+            if (slot.sum_wk_q16 == std::numeric_limits<int64_t>::min()) {
+                const int32_t* row_w = g_model.progress_q16.data() + static_cast<size_t>(slot.yo_wk_inv) * kBonaFeEnd;
+                int64_t sw = 0;
+                for (int i = 0; i < n; ++i) sw += row_w[fw_list[i]];
+                slot.sum_wk_q16 = sw;
+            }
+        }
+    };
+
+    if (cur_slot.epoch == cur_epoch && cur_slot.pos_key == cur_pkey) {
+        finalize_progress(cur_slot);
         return cur_slot;
     }
 
-    // Walk back up to 8 plies in `board.history_` to locate the nearest cached ancestor
-    const size_t hist_sz = board.history_.size();
-    const size_t max_back = std::min<size_t>(hist_sz, 8);
-    uint64_t ancestor_pkeys[9];
+    // Walk back up the ply-indexed DFS stack (`hist_sz - back`) to locate the nearest ancestor.
+    // Because child subtrees write strictly to `> hist_sz`, parent slots are NEVER evicted!
+    const size_t max_back = std::min<size_t>(hist_sz, sc_mask);
+    uint64_t ancestor_pkeys[NNUE_STACK_SIZE_MAIN + 1];
     ancestor_pkeys[0] = cur_pkey;
 
     size_t found_back = 0;
     for (size_t back = 1; back <= max_back; ++back) {
-        const StateInfo& si = board.history_[hist_sz - back];
-        // `si.hash` was before `si.mover` moved, so `si.mover` was side-to-move at `si.hash`
+        const size_t anc_idx    = hist_sz - back;
+        const StateInfo& si     = board.history_[anc_idx];
         const uint64_t anc_pkey = (si.mover == WHITE) ? (si.hash ^ Zobrist::side) : si.hash;
         ancestor_pkeys[back] = anc_pkey;
-        const NnueStateEntry& anc_slot = g_state_cache[anc_pkey & NNUE_CACHE_MASK];
-        if (anc_slot.epoch == g_cache_epoch && anc_slot.pos_key == anc_pkey) {
+        const NnueStateEntry& anc_slot = ws.state_cache[anc_idx & sc_mask];
+        if (anc_slot.epoch == cur_epoch && anc_slot.pos_key == anc_pkey) {
             found_back = back;
             break;
         }
     }
 
     if (found_back > 0) {
-        const NnueStateEntry* prev_ptr = &g_state_cache[ancestor_pkeys[found_back] & NNUE_CACHE_MASK];
-        NnueStateEntry* tmp_buf = g_tmp_state.ptr;
         bool ok = true;
         for (size_t b = found_back; b >= 1; --b) {
+            const size_t src_idx     = (hist_sz - b) & sc_mask;
+            const size_t dst_idx     = (hist_sz - b + 1) & sc_mask;
             const StateInfo& step_si = board.history_[hist_sz - b];
-            NnueStateEntry& next_buf = (b == 1 && prev_ptr != &cur_slot) ? cur_slot : tmp_buf[b & 1];
-            if (!apply_incremental_step(step_si, *prev_ptr, next_buf, ancestor_pkeys[b - 1])) {
+            if (!apply_incremental_step(step_si, ws.state_cache[src_idx], ws.state_cache[dst_idx],
+                                        ancestor_pkeys[b - 1], cur_epoch)) {
                 ok = false;
                 break;
             }
-            prev_ptr = &next_buf;
         }
         if (ok) {
-            if (prev_ptr != &cur_slot) {
-                simd_copy_i16(cur_slot.acc[BLACK], prev_ptr->acc[BLACK], g_model.half_dims);
-                simd_copy_i16(cur_slot.acc[WHITE], prev_ptr->acc[WHITE], g_model.half_dims);
-                cur_slot.pos_key    = prev_ptr->pos_key;
-                cur_slot.epoch      = prev_ptr->epoch;
-                cur_slot.yo_bk      = prev_ptr->yo_bk;
-                cur_slot.yo_wk_inv  = prev_ptr->yo_wk_inv;
-                cur_slot.sum_bk_q16 = prev_ptr->sum_bk_q16;
-                cur_slot.sum_wk_q16 = prev_ptr->sum_wk_q16;
-            }
-            // Finalize any lazy king-move progress sum on `cur_slot` before returning
             if (g_model.progress_loaded &&
                 (cur_slot.sum_bk_q16 == std::numeric_limits<int64_t>::min() ||
                  cur_slot.sum_wk_q16 == std::numeric_limits<int64_t>::min())) {
@@ -1521,32 +1703,36 @@ int select_layer_stack_bucket(const Board& board, const NnueStateEntry& st) {
     return std::clamp(b, 0, g_model.layer_stacks - 1);
 }
 
-int evaluate_nnue_incremental(const Board& board) {
+int evaluate_nnue_with_ctx(const Board& board, EvalWorkerContext& ws) {
     if (board.king_sq(BLACK) == SQ_NONE || board.king_sq(WHITE) == SQ_NONE) {
         return material_eval(board);
     }
 
+    const uint32_t cur_epoch = ws.synced_epoch;
     const uint64_t hkey = board.hash();
-    EvalHashEntry& e = g_ehash[hkey & EHASH_MASK];
-    if (e.epoch == g_cache_epoch && e.key == hkey) {
+    EvalHashEntry& e = ws.ehash[hkey & ws.ehash_mask];
+    if (e.epoch == cur_epoch && e.key == hkey) {
         return e.score_stm;
     }
 
-    const NnueStateEntry& st = get_or_update_nnue_state(board);
+    const NnueStateEntry& st = get_or_update_nnue_state(board, ws);
     const int half_dims = g_model.half_dims;
     const Color stm = board.side_to_move();
 
-    uint8_t* const tf = g_tf_buf.ptr;
-    pairwise_transform_perspective(st.acc[stm],  tf,                 half_dims);
-    pairwise_transform_perspective(st.acc[~stm], tf + half_dims / 2, half_dims);
+    uint8_t* const tf = ws.tf_buf.ptr;
+    int n_nz = 0;
+    pairwise_transform_perspective(st.acc[stm],  tf,                 half_dims, 0,              ws.nz_offsets, n_nz);
+    pairwise_transform_perspective(st.acc[~stm], tf + half_dims / 2, half_dims, half_dims / 2, ws.nz_offsets, n_nz);
 
     const int bucket = select_layer_stack_bucket(board, st);
-    const int32_t raw_out = propagate_sfnn_stack(g_model.stacks[static_cast<size_t>(bucket)], tf, half_dims);
-    const int32_t scaled  = std::clamp<int32_t>(raw_out / g_fv_scale, -kMaxEvalScore, kMaxEvalScore);
+    const int32_t raw_out = propagate_sfnn_stack(
+        g_model.stacks[static_cast<size_t>(bucket)], tf, half_dims, ws.nz_offsets, n_nz);
+    const int fv_scale    = ws.synced_fv_scale;
+    const int32_t scaled  = std::clamp<int32_t>(raw_out / fv_scale, -kMaxEvalScore, kMaxEvalScore);
 
     e.key       = hkey;
     e.score_stm = scaled;
-    e.epoch     = g_cache_epoch;
+    e.epoch     = cur_epoch;
     return scaled;
 }
 
@@ -1643,7 +1829,7 @@ int evaluate_nnue_scalar_reference(const Board& board) {
         out += act * st.fc2_w[o];
     }
 
-    return std::clamp<int32_t>(out / g_fv_scale, -kMaxEvalScore, kMaxEvalScore);
+    return std::clamp<int32_t>(out / g_fv_scale.load(std::memory_order_relaxed), -kMaxEvalScore, kMaxEvalScore);
 }
 
 } // namespace
@@ -1653,41 +1839,47 @@ int evaluate_nnue_scalar_reference(const Board& board) {
 // ============================================================
 
 void set_eval_dir(const std::string& dir) {
-    g_eval_dir           = dir;
-    g_explicit_eval_dir  = !dir.empty();
-    g_loaded_once        = false;
-    ++g_config_epoch;
+    std::lock_guard<std::mutex> lock(g_eval_mutex);
+    g_fast_ready.store(false, std::memory_order_relaxed);
+    g_eval_dir          = dir;
+    g_explicit_eval_dir = !dir.empty();
+    g_loaded_once.store(false, std::memory_order_release);
+    g_config_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void set_eval_file_path(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_eval_mutex);
+    g_fast_ready.store(false, std::memory_order_relaxed);
     g_eval_file_path     = path;
     g_explicit_eval_file = !path.empty();
     if (path.empty()) {
         g_explicit_prog_file = false;
         g_prog_file_path.clear();
     }
-    g_loaded_once        = false;
-    ++g_config_epoch;
+    g_loaded_once.store(false, std::memory_order_release);
+    g_config_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void set_progress_file_path(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_eval_mutex);
+    g_fast_ready.store(false, std::memory_order_relaxed);
     g_prog_file_path     = path;
     g_explicit_prog_file = !path.empty();
-    g_loaded_once        = false;
-    ++g_config_epoch;
+    g_loaded_once.store(false, std::memory_order_release);
+    g_config_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void set_fv_scale(int scale) {
     const int clamped = std::clamp(scale, 1, 256);
-    if (clamped != g_fv_scale) {
-        g_fv_scale = clamped;
-        std::fill(g_ehash.begin(), g_ehash.end(), EvalHashEntry{});
-        ++g_config_epoch;
+    const int prev = g_fv_scale.exchange(clamped, std::memory_order_relaxed);
+    if (clamped != prev) {
+        bump_cache_epoch();
+        g_config_epoch.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 int get_fv_scale() {
-    return g_fv_scale;
+    return g_fv_scale.load(std::memory_order_relaxed);
 }
 
 void clear_eval_caches() {
@@ -1695,7 +1887,45 @@ void clear_eval_caches() {
 }
 
 uint32_t get_eval_config_epoch() {
-    return g_config_epoch;
+    return g_config_epoch.load(std::memory_order_relaxed);
+}
+
+void prepare_eval_threads(int num_threads) {
+    ensure_loaded();
+    const int cnt = std::clamp(num_threads, 1, MAX_EVAL_THREADS);
+    const bool need_nnue = (g_family == EvalFamily::SFNN_NNUE);
+    {
+        std::lock_guard<std::mutex> lock(g_eval_mutex);
+        const uint32_t cur_ep = g_cache_epoch.load(std::memory_order_relaxed);
+        const int      cur_sc = g_fv_scale.load(std::memory_order_relaxed);
+        for (int tid = 0; tid < cnt; ++tid) {
+            const size_t idx = static_cast<size_t>(tid);
+            if (!g_eval_workers[idx]) {
+                g_eval_workers[idx] = std::make_unique<EvalWorkerContext>(tid);
+            }
+            EvalWorkerContext* ctx = g_eval_workers[idx].get();
+            if (need_nnue) {
+                ctx->ensure_nnue_buffers(tid);
+            }
+            if (ctx->synced_epoch != cur_ep) {
+                if (cur_ep < ctx->synced_epoch) {
+                    std::fill(ctx->ehash.begin(), ctx->ehash.end(), EvalHashEntry{});
+                    if (ctx->state_cache.ptr) {
+                        for (size_t i = 0; i <= ctx->state_mask; ++i) ctx->state_cache[i].epoch = 0;
+                    }
+                }
+                ctx->synced_epoch = cur_ep;
+            }
+            if (ctx->synced_fv_scale != cur_sc) {
+                std::fill(ctx->ehash.begin(), ctx->ehash.end(), EvalHashEntry{});
+                ctx->synced_fv_scale = cur_sc;
+            }
+            g_eval_worker_ptrs[idx].store(ctx, std::memory_order_release);
+            g_fast_workers[idx] = ctx;
+        }
+        g_fast_thread_cnt = cnt;
+        g_fast_ready.store(need_nnue, std::memory_order_release);
+    }
 }
 
 std::string eval_status_message() {
@@ -1708,11 +1938,21 @@ EvalFamily get_eval_family() {
     return g_family;
 }
 
-int evaluate(const Board& board) {
+int evaluate(const Board& board, int thread_id) {
+    if (g_fast_ready.load(std::memory_order_relaxed) &&
+        static_cast<unsigned>(thread_id) < static_cast<unsigned>(g_fast_thread_cnt)) {
+        return evaluate_nnue_with_ctx(board, *g_fast_workers[thread_id]);
+    }
     ensure_loaded();
-    if (g_family == EvalFamily::SFNN_NNUE)
-        return evaluate_nnue_incremental(board);
+    if (g_family == EvalFamily::SFNN_NNUE) {
+        EvalWorkerContext& ws = get_or_create_eval_worker(thread_id, /*need_nnue_buffers=*/true);
+        return evaluate_nnue_with_ctx(board, ws);
+    }
     return material_eval(board);
+}
+
+int evaluate(const Board& board) {
+    return evaluate(board, 0);
 }
 
 int evaluate_full_reference(const Board& board) {
@@ -1722,23 +1962,33 @@ int evaluate_full_reference(const Board& board) {
     return material_eval(board);
 }
 
-double evaluate_progress(const Board& board) {
+double evaluate_progress(const Board& board, int thread_id) {
     ensure_loaded();
     if (g_family == EvalFamily::SFNN_NNUE && g_model.progress_loaded &&
         board.king_sq(BLACK) != SQ_NONE && board.king_sq(WHITE) != SQ_NONE) {
-        const NnueStateEntry& st = get_or_update_nnue_state(board);
+        EvalWorkerContext& ws = get_or_create_eval_worker(thread_id, /*need_nnue_buffers=*/true);
+        const NnueStateEntry& st = get_or_update_nnue_state(board, ws);
         const double logit = static_cast<double>(st.sum_bk_q16 + st.sum_wk_q16) / kProgressQ16Scale;
         return 1.0 / (1.0 + std::exp(-logit));
     }
     return heuristic_progress(board);
 }
 
-int evaluate_progress_bucket(const Board& board) {
+double evaluate_progress(const Board& board) {
+    return evaluate_progress(board, 0);
+}
+
+int evaluate_progress_bucket(const Board& board, int thread_id) {
     ensure_loaded();
     if (g_family == EvalFamily::SFNN_NNUE &&
         board.king_sq(BLACK) != SQ_NONE && board.king_sq(WHITE) != SQ_NONE) {
-        const NnueStateEntry& st = get_or_update_nnue_state(board);
+        EvalWorkerContext& ws = get_or_create_eval_worker(thread_id, /*need_nnue_buffers=*/true);
+        const NnueStateEntry& st = get_or_update_nnue_state(board, ws);
         return select_layer_stack_bucket(board, st);
     }
     return std::clamp(static_cast<int>(heuristic_progress(board) * 8.0), 0, 7);
+}
+
+int evaluate_progress_bucket(const Board& board) {
+    return evaluate_progress_bucket(board, 0);
 }

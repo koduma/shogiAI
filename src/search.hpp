@@ -3,15 +3,22 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <vector>
 
-constexpr int INF        = 1'000'000;
-constexpr int MATE_VALUE = 900'000;   // returned for checkmate/no-moves
-constexpr int MAX_DEPTH  = 64;
+constexpr int INF                = 1'000'000;
+constexpr int MATE_VALUE         = 900'000;   // returned for checkmate/no-moves
+constexpr int MAX_DEPTH          = 64;
+constexpr int MAX_SEARCH_THREADS = 256;
 
-// Global stop flag (set by USI "stop" command or when time expires)
+// Global stop flag (set by USI "stop" command, hard time expiry, or nodelimit expiry)
 extern std::atomic<bool> g_stop;
+
+// Configurable node cap (`nodelimit` USI engine option):
+//   0   -> normal search (no node cap)
+//   x>0 -> search at most `x` nodes across all threads and play the best move
+extern std::atomic<uint64_t> nodelimit;
 
 struct SearchInfo {
     int depth = 0;
@@ -53,10 +60,22 @@ struct TimeBudget {
     int hard_ms = 1000;
 };
 
-// Configure Transposition Table size in MiB (USI_Hash option, default 64 MiB).
+// Configure/query number of Lazy SMP worker threads (USI `Threads`, range 1..256).
+void set_num_threads(int threads);
+int  get_num_threads();
+int  default_hardware_threads();
+
+// Cleanly shut down persistent Lazy SMP worker threads before process exit.
+void search_shutdown_threads();
+
+// Configure/query `nodelimit` (0 = unlimited, x > 0 = strict cap of x total nodes).
+void     set_nodelimit(uint64_t limit);
+uint64_t get_nodelimit();
+
+// Configure Transposition Table size in MiB (USI_Hash option, default 256 MiB).
 void set_tt_size_mb(size_t mb);
 
-// Clear Transposition Table and all history heuristics (called on `usinewgame`).
+// Clear Transposition Table and all worker history heuristics (called on `usinewgame`).
 void search_clear_game_state();
 
 // Start the clock for a search
@@ -79,11 +98,13 @@ Move iterative_deepening(Board& board, int allotted_ms,
                          const std::function<void()>& started_cb = {},
                          int max_depth_limit = MAX_DEPTH);
 
-// Iterative-deepening entry point with separate soft (optimum) and hard (maximum) time limits.
+// Iterative-deepening entry point with separate soft/hard time limits, Lazy SMP multithreading,
+// and optional per-go node cap (`go_nodes_limit`, combined with `nodelimit` option when > 0).
 Move iterative_deepening_timed(Board& board, TimeBudget budget,
                                const std::function<void(const SearchInfo&)>& info_cb = {},
                                const std::function<void()>& started_cb = {},
-                               int max_depth_limit = MAX_DEPTH);
+                               int max_depth_limit = MAX_DEPTH,
+                               uint64_t go_nodes_limit = 0);
 
 // Single-depth negamax alpha-beta (exposed for testing)
 int negamax(Board& board, int depth, int alpha, int beta, int ply);

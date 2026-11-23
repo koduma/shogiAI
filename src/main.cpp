@@ -15,10 +15,18 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <cctype>
 #include <future>
 #include <memory>
 #include <thread>
 #include <utility>
+
+namespace {
+std::string to_lower_ascii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+} // namespace
 
 // ============================================================
 // USI main loop
@@ -28,6 +36,7 @@ int main() {
     std::cin.tie(nullptr);
 
     Zobrist::init();
+    set_num_threads(default_hardware_threads());
 
     Board board;
     board.set_startpos();
@@ -50,7 +59,9 @@ int main() {
         if (cmd == "usi") {
             std::cout << "id name ShogiEngine\n";
             std::cout << "id author ShogiAI\n";
-            std::cout << "option name USI_Hash type spin default 64 min 4 max 2048\n";
+            std::cout << "option name Threads type spin default " << get_num_threads() << " min 1 max " << MAX_SEARCH_THREADS << "\n";
+            std::cout << "option name USI_Hash type spin default 128 min 4 max 4096\n";
+            std::cout << "option name nodelimit type spin default 0 min 0 max 2147483647\n";
             std::cout << "option name EvalDir type string default eval\n";
             std::cout << "option name EvalFile type string default eval/nn.bin\n";
             std::cout << "option name ProgressFile type string default eval/progress.bin\n";
@@ -60,7 +71,10 @@ int main() {
 
         // ---- isready ----
         } else if (cmd == "isready") {
-            std::cout << "info string " << eval_status_message() << "\n";
+            prepare_eval_threads(get_num_threads());
+            std::cout << "info string " << eval_status_message()
+                      << " [Threads=" << get_num_threads()
+                      << ", nodelimit=" << get_nodelimit() << "]\n";
             std::cout << "readyok\n";
             std::cout.flush();
 
@@ -76,13 +90,24 @@ int main() {
                 if (!value.empty()) value += ' ';
                 value += tok;
             }
+            const std::string lname = to_lower_ascii(name);
             if (name == "EvalDir") {
                 set_eval_dir(value);
             } else if (name == "EvalFile") {
                 set_eval_file_path(value);
             } else if (name == "ProgressFile") {
                 set_progress_file_path(value);
-            } else if (name == "USI_Hash" && !value.empty()) {
+            } else if ((lname == "threads" || lname == "usi_threads") && !value.empty()) {
+                try { set_num_threads(std::stoi(value)); } catch (...) {}
+            } else if ((lname == "nodelimit" || lname == "nodeslimit") && !value.empty()) {
+                try {
+                    if (!value.empty() && value[0] == '-') {
+                        set_nodelimit(0);
+                    } else {
+                        set_nodelimit(static_cast<uint64_t>(std::stoull(value)));
+                    }
+                } catch (...) {}
+            } else if ((lname == "usi_hash" || lname == "hash") && !value.empty()) {
                 try { set_tt_size_mb(static_cast<size_t>(std::stoul(value))); } catch (...) {}
             } else if (name == "FV_SCALE" && !value.empty()) {
                 try { set_fv_scale(std::stoi(value)); } catch (...) {}
@@ -133,6 +158,7 @@ int main() {
         } else if (cmd == "go") {
             int btime = -1, wtime = -1, binc = 0, winc = 0, byoyomi = 0, movetime = -1;
             int depth_limit = MAX_DEPTH;
+            uint64_t go_nodes = 0;
             bool infinite = false;
 
             std::string tok;
@@ -144,6 +170,7 @@ int main() {
                 else if (tok == "byoyomi" ) iss >> byoyomi;
                 else if (tok == "movetime") iss >> movetime;
                 else if (tok == "depth"   ) iss >> depth_limit;
+                else if (tok == "nodes"   ) iss >> go_nodes;
                 else if (tok == "infinite") infinite = true;
             }
 
@@ -152,7 +179,7 @@ int main() {
                 int ms = std::max(1, movetime - 15);
                 budget = {ms, ms};
             } else if (infinite) {
-                budget = {0, 0}; // run until explicit `stop` or max depth
+                budget = {0, 0};
             } else if (btime >= 0 || wtime >= 0 || byoyomi > 0) {
                 const bool is_black = (board.side_to_move() == BLACK);
                 const int my_time = is_black ? btime : wtime;
@@ -160,17 +187,16 @@ int main() {
                 const double prog = evaluate_progress(board);
                 budget = compute_time_budget(std::max(0, my_time), std::max(0, my_inc),
                                              std::max(0, byoyomi), board.ply_, prog);
+            } else if (get_nodelimit() > 0 || go_nodes > 0) {
+                budget = {0, 0};
             } else {
                 budget = {1500, 2000};
             }
 
-            std::cout << "info string " << eval_status_message() << "\n";
-            std::cout.flush();
-
             auto search_board = std::make_unique<Board>(board);
             std::promise<void> started;
             std::future<void> search_started = started.get_future();
-            search_thread = std::thread([search_board = std::move(search_board), budget, depth_limit,
+            search_thread = std::thread([search_board = std::move(search_board), budget, depth_limit, go_nodes,
                                          started = std::move(started)]() mutable {
                 Move best = iterative_deepening_timed(*search_board, budget, [](const SearchInfo& info) {
                     std::cout << "info depth " << info.depth
@@ -184,7 +210,7 @@ int main() {
                     for (Move m : info.pv) std::cout << ' ' << move_to_usi(m);
                     std::cout << "\n";
                     std::cout.flush();
-                }, [&started] { started.set_value(); }, depth_limit);
+                }, [&started] { started.set_value(); }, depth_limit, go_nodes);
 
                 if (best == MOVE_NONE) {
                     std::cout << "bestmove resign\n";
@@ -210,6 +236,7 @@ int main() {
         g_stop.store(true);
         search_thread.join();
     }
+    search_shutdown_threads();
 
     return 0;
 }
